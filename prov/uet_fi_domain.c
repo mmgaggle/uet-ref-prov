@@ -621,7 +621,8 @@ int uetfi_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 		return -FI_ENOMEM;
 	ret = uetfi_if_query(name, &dom->ifinfo);
 	if (ret) {
-		UETFI_WARN(FI_LOG_DOMAIN, "netdev %s is not usable\n", name);
+		UETFI_WARN(FI_LOG_DOMAIN, "%s is not usable (%s)\n", name,
+			   uetfi_core_desc.if_usable);
 		free(dom);
 		return -FI_ENODEV;
 	}

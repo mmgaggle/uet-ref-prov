@@ -205,6 +205,8 @@ static ssize_t uetfi_write_common(struct uetfi_ep *ep, const void *buf,
 		return -FI_ENOCQ;
 	if (len > UETFI_MAX_MSG_SIZE)
 		return -FI_EMSGSIZE;
+	if (data && !uetfi_core_desc.cq_data_size)
+		return -FI_ENOSYS;	/* cq_data_size is 0 */
 	peer = uetfi_av_peer(ep->av, dest);
 	if (!peer)
 		return -FI_EINVAL;

@@ -14,6 +14,7 @@
 #define _UET_FI_H_
 
 #include <net/if.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -44,8 +45,10 @@
 #define UETFI_MAX_MR_CNT	65536
 #define UETFI_MAX_MSG_SIZE	((size_t) 0xfffffffe)	/* UET_MAX_MSG_SIZE */
 #define UETFI_MR_KEY_SIZE	sizeof(uint64_t)
-#define UETFI_CQ_DATA_SIZE	sizeof(uint64_t)
+#define UETFI_CQ_DATA_SIZE	sizeof(uint64_t)	/* the most a core offers */
 #define UETFI_CQ_MAX_EPS	8
+/* a netdev name, or an ibverbs device name, which can be longer */
+#define UETFI_NAME_MAX		64
 
 #define UETFI_CAPS	(FI_RMA | FI_WRITE | FI_REMOTE_WRITE | FI_REMOTE_COMM)
 #define UETFI_TX_CAPS	(FI_RMA | FI_WRITE)
@@ -124,11 +127,14 @@ static inline void uetfi_dlist_remove(struct uetfi_dlist *e)
 #define uetfi_dlist_foreach(h, it) \
 	for ((it) = (h)->next; (it) != (h); (it) = (it)->next)
 
-/* network interface backing a domain */
+/*
+ * What backs a domain: a netdev for the reference core, an ionic RDMA
+ * device for the ernic core.
+ */
 struct uetfi_ifinfo {
-	char name[IFNAMSIZ];
+	char name[UETFI_NAME_MAX];
 	uint32_t ipv4;		/* host byte order */
-	unsigned int mtu;
+	unsigned int mtu;	/* 0 if unknown */
 };
 
 struct uetfi_fabric {
@@ -248,8 +254,26 @@ struct uetfi_ep {
 	size_t err_head, err_count;
 };
 
-/* uet_fi_init.c */
+/*
+ * uet_fi_if_netdev.c (CORE=ref) or uet_fi_if_ernic.c (CORE=ernic): where
+ * the core runs and which address it has there
+ */
+struct uetfi_core_desc {
+	const char *name;		/* "ref" or "ernic" */
+	const char *if_env;		/* names the interface to the core */
+	const char *if_usable;		/* what makes an interface usable */
+	const char *init_hint;		/* why uet_initialize can fail */
+	size_t cq_data_size;		/* immediate data; 0 if the core has none */
+	size_t segment_size;		/* default FI_UET_SEGMENT_SIZE */
+	int max_segments;		/* default FI_UET_MAX_SEGMENTS */
+};
+extern const struct uetfi_core_desc uetfi_core_desc;
 int uetfi_if_query(const char *name, struct uetfi_ifinfo *ifinfo);
+int uetfi_if_foreach(int (*fn)(const struct uetfi_ifinfo *, void *),
+		     void *arg);
+
+/* uet_fi_init.c */
+extern pthread_mutex_t uetfi_env_lock;	/* held while if_env is changed */
 void uetfi_addr_encode(const struct uet_addr *addr, uint8_t *wire);
 int uetfi_addr_decode(const void *wire, size_t len, struct uet_addr *addr);
 void uetfi_addr_default(struct uet_addr *addr, uint32_t ipv4);

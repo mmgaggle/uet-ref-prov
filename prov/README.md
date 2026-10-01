@@ -29,6 +29,38 @@ which needs `CAP_NET_RAW`, for example:
 `prov/run_tests.sh all` creates network namespaces, runs the scenarios
 below with `prov/test_rma`, and removes the namespaces again.
 
+## Over a rocm-ernic engine (CORE=ernic)
+
+The same glue can run over `libuet_ernic` instead of the reference
+core. `libuet_ernic` is part of rocm-ernic, an emulated AMD Pensando
+ionic NIC that runs the reference provider's SES/PDS/TSS as device
+firmware (its `--uet` option). In a guest with such a device, the
+library drives the engine through an RC queue pair on the ionic
+device, so the provider needs no raw socket and no privilege.
+
+    make -C prov ernic ERNIC=/path/to/rocm-ernic   # ernic/libuet-fi.so
+    FI_PROVIDER_PATH=$PWD/prov/ernic fi_info -p uet
+
+`ERNIC` defaults to `../../rocm-ernic`. `libuet_ernic.c` is compiled
+into the library, which links `-lfabric -libverbs`. `test_rma` uses
+only libfabric and serves both builds.
+
+What differs from the reference core:
+
+* A domain is an ibverbs device, not a netdev: `hints->domain_attr->name`,
+  `FI_UET_IFNAME` or `UET_ERNIC_DEVICE`, else one `fi_info` for every
+  ionic device whose engine answers. The address is the engine's, not
+  one of the guest's.
+* `cq_data_size` is 0, and `fi_writedata()` returns `-FI_ENOSYS`: the
+  engine raises no events at the target. A target checks its window.
+* `fi_close()` cannot discard writes already handed to the device
+  (`uet_ep_abort()` returns `-FI_ENOSYS`), so it drops the queued ones
+  and waits up to 10 s for the rest, as with `UET_PDS=sng`.
+* Writes go in segments of 1 MiB, 4 in flight: each segment is a
+  command to the device, and the device paces RUDI itself.
+* `FI_UET_TX_TIMEOUT` and `FI_UET_TX_RETRIES` do not apply; the
+  engine's retransmit settings are the device's (`--uet rto=,retries=`).
+
 ## fi_getinfo
 
 Accepted hints: provider `uet`, `FI_EP_RDM`, caps from
@@ -142,12 +174,12 @@ atomic and collective operations return `-FI_ENOSYS`.
 
 | variable | default | meaning |
 |----------|---------|---------|
-| `FI_UET_IFNAME` | `$UET_IFNAME` | netdev when the hints do not name one |
+| `FI_UET_IFNAME` | `$UET_IFNAME` (`$UET_ERNIC_DEVICE` for CORE=ernic) | netdev (ibverbs device for CORE=ernic) when the hints do not name one |
 | `FI_UET_RUDI` | 1 | mark remotely writable regions `IDEMPOTENT_SAFE` and set `UET_FORCE_RUDI` |
 | `FI_UET_TX_TIMEOUT` | `$UET_PDS_TX_TIMEOUT`, else 200 | retransmit timeout in ms |
 | `FI_UET_TX_RETRIES` | `$UET_PDS_MAX_TX_RETRIES`, else 25 | retransmissions before a write fails |
-| `FI_UET_SEGMENT_SIZE` | 16384 | bytes per write segment |
-| `FI_UET_MAX_SEGMENTS` | 2 | segments in flight per endpoint |
+| `FI_UET_SEGMENT_SIZE` | 16384 (1048576 for CORE=ernic) | bytes per write segment |
+| `FI_UET_MAX_SEGMENTS` | 2 (4 for CORE=ernic) | segments in flight per endpoint |
 | `FI_UET_PROGRESS_BURST` | 64 | core progress calls per CQ read; each handles at most one received packet |
 
 When a domain is first opened, the provider sets `UET_PDS=pds` unless

@@ -5,13 +5,11 @@
 
 #include <arpa/inet.h>
 #include <errno.h>
-#include <net/if_arp.h>
 #include <netdb.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -22,8 +20,8 @@ struct uetfi_params uetfi_params = {
 	.rudi = 1,
 	.tx_timeout_ms = -1,
 	.progress_burst = 64,
-	.segment_size = 16384,
-	.max_segments = 2,
+	.segment_size = 0,	/* the core's default */
+	.max_segments = 0,
 	.tx_retries = -1,
 };
 
@@ -152,57 +150,12 @@ const char *uetfi_addr_str(const void *wire, size_t len, char *buf,
 	return buf;
 }
 
-/*******************************************************************
- * network interfaces
- *******************************************************************/
-
-/*
- * Look up an interface the way the rawsock NIC shim does (SIOCGIFADDR
- * gives the primary IPv4 address the core will use). Needs no privilege.
- */
-int uetfi_if_query(const char *name, struct uetfi_ifinfo *ifinfo)
-{
-	struct ifreq ifr;
-	int fd, ret = -FI_ENODATA;
-
-	if (!name || !*name || strlen(name) >= IFNAMSIZ)
-		return -FI_EINVAL;
-
-	fd = socket(AF_INET, SOCK_DGRAM, 0);
-	if (fd < 0)
-		return -errno;
-
-	memset(&ifr, 0, sizeof(ifr));
-	strncpy(ifr.ifr_name, name, IFNAMSIZ - 1);
-	if (ioctl(fd, SIOCGIFFLAGS, &ifr) < 0)
-		goto out;
-	if (!(ifr.ifr_flags & IFF_UP) || (ifr.ifr_flags & IFF_LOOPBACK))
-		goto out;
-	if (ioctl(fd, SIOCGIFHWADDR, &ifr) < 0 ||
-	    ifr.ifr_hwaddr.sa_family != ARPHRD_ETHER)
-		goto out;
-	if (ioctl(fd, SIOCGIFMTU, &ifr) < 0)
-		goto out;
-	ifinfo->mtu = ifr.ifr_mtu;
-	ifr.ifr_addr.sa_family = AF_INET;
-	if (ioctl(fd, SIOCGIFADDR, &ifr) < 0)
-		goto out;
-	ifinfo->ipv4 = ntohl(((struct sockaddr_in *) &ifr.ifr_addr)->
-			     sin_addr.s_addr);
-	memset(ifinfo->name, 0, sizeof(ifinfo->name));
-	strncpy(ifinfo->name, name, IFNAMSIZ - 1);
-	ret = 0;
-out:
-	close(fd);
-	return ret;
-}
-
-/* the netdev to use when the application does not name one */
+/* the interface to use when the application does not name one */
 static const char *uetfi_default_ifname(void)
 {
 	if (uetfi_params.ifname && *uetfi_params.ifname)
 		return uetfi_params.ifname;
-	return getenv("UET_IFNAME");
+	return getenv(uetfi_core_desc.if_env);
 }
 
 /*******************************************************************
@@ -215,10 +168,12 @@ static const char *uetfi_default_ifname(void)
  * domain on that netdev. Endpoints all get the default resource index,
  * so a process has one endpoint at a time.
  */
+pthread_mutex_t uetfi_env_lock = PTHREAD_MUTEX_INITIALIZER;
+
 static struct {
 	pthread_mutex_t lock;
 	uet_handle_t h;
-	char ifname[IFNAMSIZ];
+	char ifname[UETFI_NAME_MAX];
 	int refs;
 	bool ep_open;
 } uetfi_core = {
@@ -272,27 +227,28 @@ int uetfi_core_get(const char *ifname, uet_handle_t *h)
 		goto out;
 	}
 
+	pthread_mutex_lock(&uetfi_env_lock);
 	uetfi_core_env();
-	cur = getenv("UET_IFNAME");
+	cur = getenv(uetfi_core_desc.if_env);
 	if (cur)
 		saved = strdup(cur);
-	setenv("UET_IFNAME", ifname, 1);
+	setenv(uetfi_core_desc.if_env, ifname, 1);
 	ret = uet_initialize(&uetfi_core.h);
 	if (saved) {
-		setenv("UET_IFNAME", saved, 1);
+		setenv(uetfi_core_desc.if_env, saved, 1);
 		free(saved);
 	} else {
-		unsetenv("UET_IFNAME");
+		unsetenv(uetfi_core_desc.if_env);
 	}
+	pthread_mutex_unlock(&uetfi_env_lock);
 	if (ret) {
 		UETFI_WARN(FI_LOG_DOMAIN,
-			   "uet_initialize on %s failed: %s (the raw socket "
-			   "NIC shim needs CAP_NET_RAW)\n", ifname,
-			   fi_strerror(-ret));
+			   "uet_initialize on %s failed: %s (%s)\n", ifname,
+			   fi_strerror(-ret), uetfi_core_desc.init_hint);
 		goto out;
 	}
 	memset(uetfi_core.ifname, 0, sizeof(uetfi_core.ifname));
-	strncpy(uetfi_core.ifname, ifname, IFNAMSIZ - 1);
+	strncpy(uetfi_core.ifname, ifname, UETFI_NAME_MAX - 1);
 	uetfi_core.refs = 1;
 	*h = uetfi_core.h;
 out:
@@ -410,7 +366,7 @@ static int uetfi_check_hints(uint32_t version, const struct fi_info *hints)
 			       "supported\n");
 		if ((da->mr_mode & UETFI_MR_MODE) != UETFI_MR_MODE)
 			REJECT("the application must support FI_MR_PROV_KEY\n");
-		if (da->cq_data_size > UETFI_CQ_DATA_SIZE)
+		if (da->cq_data_size > uetfi_core_desc.cq_data_size)
 			REJECT("cq_data_size too large\n");
 		if (da->mr_cnt > UETFI_MAX_MR_CNT)
 			REJECT("mr_cnt too large\n");
@@ -561,7 +517,7 @@ static struct fi_info *uetfi_info_alloc(uint32_t version,
 				     FI_AV_UNSPEC;
 	info->domain_attr->mr_mode = UETFI_MR_MODE;
 	info->domain_attr->mr_key_size = UETFI_MR_KEY_SIZE;
-	info->domain_attr->cq_data_size = UETFI_CQ_DATA_SIZE;
+	info->domain_attr->cq_data_size = uetfi_core_desc.cq_data_size;
 	info->domain_attr->cq_cnt = 64;
 	info->domain_attr->ep_cnt = 1;
 	info->domain_attr->tx_ctx_cnt = 1;
@@ -596,13 +552,41 @@ err:
 	return NULL;
 }
 
+/* collects one fi_info per usable interface */
+struct uetfi_getinfo_walk {
+	uint32_t version;
+	const struct fi_info *hints;
+	const uint8_t *dest;
+	bool want_src;
+	uint32_t src_ip;
+	struct fi_info *head, *tail;
+};
+
+static int uetfi_getinfo_one(const struct uetfi_ifinfo *ifinfo, void *arg)
+{
+	struct uetfi_getinfo_walk *w = arg;
+	struct fi_info *cur;
+
+	if (w->want_src && ifinfo->ipv4 != w->src_ip)
+		return 0;
+	cur = uetfi_info_alloc(w->version, w->hints, ifinfo, w->dest);
+	if (!cur)
+		return -FI_ENOMEM;
+	if (w->tail)
+		w->tail->next = cur;
+	else
+		w->head = cur;
+	w->tail = cur;
+	return 0;
+}
+
 static int uetfi_getinfo(uint32_t version, const char *node,
 			 const char *service, uint64_t flags,
 			 const struct fi_info *hints, struct fi_info **info)
 {
 	struct uetfi_ifinfo ifinfo;
-	struct if_nameindex *ifs = NULL, *ifp;
-	struct fi_info *head = NULL, *tail = NULL, *cur;
+	struct uetfi_getinfo_walk walk;
+	struct fi_info *cur;
 	struct uet_addr addr;
 	uint8_t dest_wire[UETFI_ADDR_LEN], *dest = NULL;
 	const char *ifname = NULL;
@@ -656,9 +640,8 @@ static int uetfi_getinfo(uint32_t version, const char *node,
 	if (ifname) {
 		ret = uetfi_if_query(ifname, &ifinfo);
 		if (ret) {
-			UETFI_INFO(FI_LOG_CORE, "netdev %s is not usable "
-				   "(needs to be up, Ethernet, with an IPv4 "
-				   "address)\n", ifname);
+			UETFI_INFO(FI_LOG_CORE, "%s is not usable (%s)\n",
+				   ifname, uetfi_core_desc.if_usable);
 			return -FI_ENODATA;
 		}
 		if (want_src && ifinfo.ipv4 != src_ip)
@@ -670,30 +653,20 @@ static int uetfi_getinfo(uint32_t version, const char *node,
 		return 0;
 	}
 
-	/* no netdev named: one fi_info per usable interface */
-	ifs = if_nameindex();
-	if (!ifs)
-		return -FI_ENODATA;
-	for (ifp = ifs; ifp->if_index; ifp++) {
-		if (uetfi_if_query(ifp->if_name, &ifinfo))
-			continue;
-		if (want_src && ifinfo.ipv4 != src_ip)
-			continue;
-		cur = uetfi_info_alloc(version, hints, &ifinfo, dest);
-		if (!cur) {
-			fi_freeinfo(head);
-			if_freenameindex(ifs);
-			return -FI_ENOMEM;
-		}
-		if (tail)
-			tail->next = cur;
-		else
-			head = cur;
-		tail = cur;
+	/* none named: one fi_info per usable interface */
+	memset(&walk, 0, sizeof(walk));
+	walk.version = version;
+	walk.hints = hints;
+	walk.dest = dest;
+	walk.want_src = want_src;
+	walk.src_ip = src_ip;
+	ret = uetfi_if_foreach(uetfi_getinfo_one, &walk);
+	if (ret) {
+		fi_freeinfo(walk.head);
+		return ret;
 	}
-	if_freenameindex(ifs);
-	*info = head;
-	return head ? 0 : -FI_ENODATA;
+	*info = walk.head;
+	return walk.head ? 0 : -FI_ENODATA;
 }
 
 /*******************************************************************
@@ -787,9 +760,11 @@ __attribute__((visibility("default")))
 struct fi_provider *fi_prov_ini(void)
 {
 	fi_param_define(&uetfi_prov, "ifname", FI_PARAM_STRING,
-			"Netdev to use when the application does not name "
-			"one in domain_attr->name (default: $UET_IFNAME, else "
-			"every usable Ethernet interface)");
+			"Netdev (ibverbs device for an ernic build) to use "
+			"when the application does not name one in "
+			"domain_attr->name (default: $UET_IFNAME, else every "
+			"usable Ethernet interface; $UET_ERNIC_DEVICE, else "
+			"every ionic device with an engine)");
 	fi_param_define(&uetfi_prov, "rudi", FI_PARAM_BOOL,
 			"Mark remotely writable regions IDEMPOTENT_SAFE and "
 			"send writes without immediate data as connectionless "
@@ -806,17 +781,20 @@ struct fi_provider *fi_prov_ini(void)
 
 	fi_param_define(&uetfi_prov, "segment_size", FI_PARAM_SIZE_T,
 			"Writes are sent in segments of this many bytes "
-			"(default: 16384)");
+			"(default: 16384, 1048576 over an ernic engine)");
 	fi_param_define(&uetfi_prov, "max_segments", FI_PARAM_INT,
 			"Write segments in flight per endpoint. The reference "
 			"provider has no flow control for RUDI, so this bounds "
-			"the burst a target has to absorb (default: 2)");
+			"the burst a target has to absorb (default: 2, 4 over "
+			"an ernic engine)");
 	fi_param_define(&uetfi_prov, "tx_retries", FI_PARAM_INT,
 			"PDS retransmissions before a write fails, exported "
 			"as UET_PDS_MAX_TX_RETRIES. A target must make progress "
 			"at least once per tx_timeout * tx_retries (default: "
 			"$UET_PDS_MAX_TX_RETRIES, else 25)");
 
+	uetfi_params.segment_size = uetfi_core_desc.segment_size;
+	uetfi_params.max_segments = uetfi_core_desc.max_segments;
 	fi_param_get_str(&uetfi_prov, "ifname", &uetfi_params.ifname);
 	fi_param_get_bool(&uetfi_prov, "rudi", &uetfi_params.rudi);
 	fi_param_get_int(&uetfi_prov, "tx_timeout",
