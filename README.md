@@ -140,6 +140,23 @@ compatibility with its external libfabric headers. The target does not link or
 install additional binaries; it provides an early check for type-incorrect core
 code and is also run by the GitHub sanity workflow.
 
+### Verbs library for device models
+
+`libuet_verbs.so` (built by `make`) and the static archive `libuet_verbs.a`
+are the `ENABLE_VERBS=1` build of the SES, PDS and TSS layers. They are meant
+to be linked into a device model, such as an emulated NIC, that runs the
+transport as its firmware. They are compiled against the headers bundled in
+`libfabric_headers` and link nothing from libfabric, so neither needs a
+libfabric tree:
+
+```sh
+make libuet_verbs.a
+```
+
+A device model plugs in its own wire with `uet_nic_register_shim()` and
+`nic_resolve_nh` (see `nic_shim/uet_nic.h`) and maps guest memory with
+`uet_set_dma_translate()` (see `uet_api.h`).
+
 ### rawsock
 
 > The `uet` program only has the `rawsock` NIC shim built into it.

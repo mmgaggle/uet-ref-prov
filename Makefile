@@ -2,9 +2,20 @@
 CC=gcc
 CLANG=clang
 
+# Goals built only from the bundled libfabric headers. The verbs library is
+# meant for device models and links nothing from libfabric, so building it
+# needs no libfabric tree.
+LF_FREE_GOALS := clean libuet_verbs.so libuet_verbs.a strict-core
+
 # Auto-discover libfabric directory by searching up parent directories
 # Use LIBFABRIC environment variable if set, otherwise auto-discover
-ifneq ($(MAKECMDGOALS),clean)
+ifneq ($(MAKECMDGOALS),)
+ifeq ($(filter-out $(LF_FREE_GOALS),$(MAKECMDGOALS)),)
+LF_NOT_NEEDED := 1
+endif
+endif
+
+ifndef LF_NOT_NEEDED
 ifndef LIBFABRIC
 LIBFABRIC := $(shell \
 	current_dir=$(CURDIR); \
@@ -60,6 +71,8 @@ FABRIC_LIB_OBJ=$(patsubst %.c, $(FABRIC_LIB_OBJ_DIR)/%.o, $(LIB_SRC))
 # Verbs shared library (ENABLE_VERBS=1)
 VERBS_LIBNAME=uet_verbs
 VERBS_LIB=lib$(VERBS_LIBNAME).so
+# Verbs static archive, the same objects, for a device model to link in
+VERBS_STATIC_LIB=lib$(VERBS_LIBNAME).a
 VERBS_LIB_OBJ_DIR=obj_libuet_verbs
 VERBS_LIB_OBJ=$(patsubst %.c, $(VERBS_LIB_OBJ_DIR)/%.o, $(LIB_SRC))
 
@@ -144,6 +157,12 @@ $(VERBS_LIB): $(VERBS_LIB_OBJ)
 	@echo 'Building verbs shared library: $@'
 	@$(CC) -shared $(VERBS_LIB_OBJ) -o $@ $(LDFLAGS)
 
+# Verbs static archive (not part of 'all'; build it with 'make libuet_verbs.a')
+$(VERBS_STATIC_LIB): $(VERBS_LIB_OBJ)
+	@echo 'Building verbs static archive: $@'
+	@rm -f $@
+	@$(AR) rcs $@ $(VERBS_LIB_OBJ)
+
 $(STRICT_FABRIC_OBJ_DIR)/%.o: %.c $(HDRS)
 	@mkdir -p $(STRICT_FABRIC_OBJ_DIR)/$(dir $<)
 	@echo 'Strict-checking fabric library object: $<'
@@ -206,7 +225,7 @@ $(CC_SIM_BIN): $(CC_SIM_OBJ)
 
 clean:
 	@rm -rf $(FABRIC_LIB_OBJ_DIR) $(FABRIC_LIB) \
-		$(VERBS_LIB_OBJ_DIR) $(VERBS_LIB) \
+		$(VERBS_LIB_OBJ_DIR) $(VERBS_LIB) $(VERBS_STATIC_LIB) \
 		$(STRICT_FABRIC_OBJ_DIR) $(STRICT_VERBS_OBJ_DIR) \
 		$(OBJ_DIR) $(BIN) \
 		$(XDP_LIB_OBJ_DIR) $(XDP_LIB) \
