@@ -121,6 +121,16 @@ atomic and collective operations return `-FI_ENOSYS`.
   sends a write as segments of 16 KiB with at most 2 in flight per
   endpoint. Writes of any size are accepted; up to `tx_attr->size`
   writes can be outstanding.
+* `fi_close()` on an endpoint discards the writes it still has
+  outstanding, as fi_endpoint(3) requires: no completion is reported for
+  them, and none of their packets is sent or retransmitted once the
+  close has started. The close takes microseconds. The same process can
+  open a new endpoint on the domain at once; it gets the same address,
+  and registered regions are bound to it. A RUD PDC that loses packets
+  this way is closed with the peer by a CLOSE control packet, which
+  carries no data, or freed if it was never established. (With
+  `UET_PDS=sng`, which cannot discard, the close waits up to 10 s for
+  writes in flight instead.)
 * Errors are reported through `fi_cq_readerr`. Transport errors such as
   an unknown key, an out-of-range offset or exhausted retries all
   arrive as `FI_EIO`, because the core does not pass the SES return
@@ -152,8 +162,6 @@ still be used directly.
   interfaces and IP addresses: the raw socket receives every UET packet
   on its interface.
 * IPv4 only. `FI_THREAD_DOMAIN` only.
-* `fi_close()` on an endpoint takes 2 s, because the core keeps
-  answering peers for one maximum segment lifetime.
 * The core logs to stdout. Its raw socket also sees outgoing and
   non-UET frames, and the PDS warns about each of them.
 * Throughput between namespaces on veth: about 250 MiB/s for one

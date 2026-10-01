@@ -16,6 +16,17 @@
  *	remote address base+offset, in chunks, with FI_DELIVERY_COMPLETE,
  *	then signal the target with a zero-length fi_writedata
  *
+ *   test_rma [opts] cutoff <addr-hex> <key-hex> <base> <len> <budget-ms> <dir>
+ *	cut off a write and carry on with a new endpoint, as a consumer
+ *	does when a write misses its deadline: write 4 KiB of zeros (so the
+ *	peer is resolved), create <dir>/ready and wait for <dir>/go (the
+ *	link is taken down in between), write <len> bytes of the pattern to
+ *	the target window, and when <budget-ms> passes close the endpoint
+ *	and CQ. Then open a new CQ and endpoint on the same domain and AV,
+ *	register a new window of <len> bytes (token in <dir>/win), wait for
+ *	<dir>/rewrite, write the pattern to the target again and signal it,
+ *	and wait for a peer to fill and signal the new window
+ *
  *   test_rma [opts] -o myfile pair <size> <peerfile>
  *	one endpoint as initiator and target at once: lend a window of
  *	<size> bytes (address in myfile), wait for the peer's file, fill
@@ -30,6 +41,8 @@
  *   -r          write: register the source buffer and pass its desc
  *   -n          write: do not signal the target
  *   -m          use FI_AV_MAP (default FI_AV_TABLE)
+ *   -z file     target: when file appears, report how many bytes of the
+ *               window are nonzero
  *   -t secs     timeout (default 120)
  *
  * The pattern byte at window offset i is a function of i alone, so any
@@ -45,6 +58,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 #include <rdma/fabric.h>
 #include <rdma/fi_cm.h>
@@ -65,6 +79,7 @@ struct opts {
 	bool reg_src;
 	bool signal;
 	bool av_map;
+	const char *snapfile;
 	int timeout;
 };
 
@@ -126,6 +141,8 @@ static int unhex(const char *s, uint8_t *b, size_t max, size_t *n)
 	return 0;
 }
 
+static int open_ep(struct res *r, enum fi_cq_format format);
+
 static int setup(struct res *r, const struct opts *o,
 		 enum fi_cq_format format)
 {
@@ -133,8 +150,6 @@ static int setup(struct res *r, const struct opts *o,
 	struct fi_av_attr av_attr = {
 		.type = o->av_map ? FI_AV_MAP : FI_AV_TABLE,
 	};
-	struct fi_cq_attr cq_attr = { .format = format, .size = 256,
-				      .wait_obj = FI_WAIT_NONE };
 	int ret;
 
 	hints = fi_allocinfo();
@@ -157,6 +172,15 @@ static int setup(struct res *r, const struct opts *o,
 	CHECK(fi_fabric(r->info->fabric_attr, &r->fabric, NULL));
 	CHECK(fi_domain(r->fabric, r->info, &r->domain, NULL));
 	CHECK(fi_av_open(r->domain, &av_attr, &r->av, NULL));
+	return open_ep(r, format);
+}
+
+/* a CQ and an enabled endpoint on the domain, bound to its AV */
+static int open_ep(struct res *r, enum fi_cq_format format)
+{
+	struct fi_cq_attr cq_attr = { .format = format, .size = 256,
+				      .wait_obj = FI_WAIT_NONE };
+
 	CHECK(fi_cq_open(r->domain, &cq_attr, &r->cq, NULL));
 	CHECK(fi_endpoint(r->domain, r->info, &r->ep, NULL));
 	CHECK(fi_ep_bind(r->ep, &r->cq->fid, FI_TRANSMIT | FI_RECV));
@@ -252,6 +276,7 @@ static int run_target(const struct opts *o, size_t size, int writers)
 	double start, last_check = 0, t_done;
 	size_t bad = size, first = 0;
 	int signals = 0, i;
+	bool snapped = false;
 	ssize_t n;
 	FILE *f;
 
@@ -313,6 +338,16 @@ static int run_target(const struct opts *o, size_t size, int writers)
 			bad = count_bad(win, expect, size, &first);
 			if (!bad && signals >= writers)
 				break;
+		}
+		if (o->snapfile && !snapped && !access(o->snapfile, F_OK)) {
+			size_t nz = 0;
+
+			for (size_t j = 0; j < size; j++)
+				nz += win[j] != 0;
+			printf("SNAPSHOT %zu of %zu bytes nonzero, %d signals\n",
+			       nz, size, signals);
+			fflush(stdout);
+			snapped = true;
 		}
 		if (now() - start > o->timeout) {
 			printf("TIMEOUT %zu of %zu bytes wrong (first at %zu), "
@@ -652,6 +687,171 @@ static int run_pair(const struct opts *o, size_t size, const char *peerfile)
 	return teardown(&r);
 }
 
+static bool dir_file(const char *dir, const char *name, bool create)
+{
+	char path[512];
+	FILE *f;
+
+	snprintf(path, sizeof(path), "%s/%s", dir, name);
+	if (!create)
+		return !access(path, F_OK);
+	f = fopen(path, "w");
+	if (f)
+		fclose(f);
+	return f != NULL;
+}
+
+/* poll the CQ until 'want' transmit completions or the deadline */
+static int poll_tx(struct res *r, size_t want, double deadline,
+		   int *signals)
+{
+	struct fi_cq_data_entry ce[16];
+	size_t got = 0;
+	ssize_t n, i;
+
+	while (got < want) {
+		n = fi_cq_read(r->cq, ce, 16);
+		if (n == -FI_EAVAIL) {
+			report_err(r->cq);
+			return -FI_EIO;
+		}
+		for (i = 0; i < n; i++) {
+			if (ce[i].flags & FI_REMOTE_CQ_DATA)
+				(*signals)++;
+			else
+				got++;
+		}
+		if (now() > deadline)
+			return -FI_ETIMEDOUT;
+	}
+	return 0;
+}
+
+static int run_cutoff(const struct opts *o, const char *addr_hex,
+		      const char *key_hex, uint64_t base, size_t len,
+		      int budget_ms, const char *dir)
+{
+	struct res r;
+	struct fid_mr *mr;
+	struct fi_context2 ctx[2];
+	char h[2 * MAX_ADDR + 1], path[512];
+	uint8_t peer_addr[MAX_ADDR], *src, *zero, *win;
+	uint64_t key, my_base;
+	size_t peer_len, i, first;
+	fi_addr_t peer;
+	double t0, tc0, tc1, deadline;
+	int ret, signals = 0;
+	FILE *f;
+
+	if (unhex(addr_hex, peer_addr, sizeof(peer_addr), &peer_len))
+		return 2;
+	key = strtoull(key_hex, NULL, 16);
+
+	memset(&r, 0, sizeof(r));
+	CHECK(setup(&r, o, FI_CQ_FORMAT_DATA));
+	src = malloc(len);
+	zero = calloc(1, 4096);
+	win = aligned_alloc(4096, (len + 4095) & ~(size_t) 4095);
+	if (!src || !zero || !win)
+		return -FI_ENOMEM;
+	for (i = 0; i < len; i++)
+		src[i] = pattern(i);
+	memset(win, 0, len);
+	if (fi_av_insert(r.av, peer_addr, 1, &peer, 0, NULL) != 1)
+		return 1;
+
+	/* warm-up: the peer is resolved and reachable, nothing visible lands */
+	CHECK(fi_write(r.ep, zero, 4096, NULL, peer, base, key, &ctx[0]));
+	CHECK(poll_tx(&r, 1, now() + o->timeout, &signals));
+	dir_file(dir, "ready", true);
+	while (!dir_file(dir, "go", false))
+		fi_cq_read(r.cq, NULL, 0);
+
+	/* the link is down now: this write cannot complete in time */
+	t0 = now();
+	CHECK(fi_write(r.ep, src, len, NULL, peer, base, key, &ctx[0]));
+	ret = poll_tx(&r, 1, t0 + budget_ms / 1000.0, &signals);
+	if (ret != -FI_ETIMEDOUT) {
+		printf("FAILED the write did not miss its deadline (%d)\n", ret);
+		return 1;
+	}
+	tc0 = now();
+	CHECK(fi_close(&r.ep->fid));
+	tc1 = now();
+	CHECK(fi_close(&r.cq->fid));
+	r.ep = NULL;
+	r.cq = NULL;
+	printf("CUTOFF after %.2f s, fi_close(ep) took %.3f ms\n", tc0 - t0,
+	       (tc1 - tc0) * 1000);
+	fflush(stdout);
+
+	/* carry on with a new endpoint on the same domain and AV */
+	CHECK(open_ep(&r, FI_CQ_FORMAT_DATA));
+	CHECK(reg(&r, win, len, FI_WRITE | FI_REMOTE_WRITE, &mr));
+	my_base = (r.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) ?
+		  (uintptr_t) win : 0;
+	hex(r.addr, r.addrlen, h);
+	snprintf(path, sizeof(path), "%s/win.tmp", dir);
+	f = fopen(path, "w");
+	if (!f)
+		return 1;
+	fprintf(f, "%s %016" PRIx64 " %" PRIu64 " %zu\n", h, fi_mr_key(mr),
+		my_base, len);
+	fclose(f);
+	snprintf(h, sizeof(h), "%s/win", dir);
+	rename(path, h);
+	printf("REOPENED a new endpoint and window, key %016" PRIx64 "\n",
+	       fi_mr_key(mr));
+	fflush(stdout);
+
+	while (!dir_file(dir, "rewrite", false))
+		fi_cq_read(r.cq, NULL, 0);
+	t0 = now();
+	CHECK(fi_write(r.ep, src, len, NULL, peer, base, key, &ctx[0]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	CHECK(fi_writedata(r.ep, NULL, 0, NULL, 1, peer, base, key, &ctx[1]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	printf("REWROTE %zu bytes with the new endpoint in %.3f s and "
+	       "signalled\n", len, now() - t0);
+	fflush(stdout);
+
+	/* and the new window takes writes */
+	deadline = now() + o->timeout;
+	while (!signals) {
+		struct fi_cq_data_entry ce[16];
+		ssize_t n = fi_cq_read(r.cq, ce, 16);
+
+		if (n == -FI_EAVAIL) {
+			report_err(r.cq);
+			return 1;
+		}
+		for (ssize_t j = 0; j < n; j++)
+			if (ce[j].flags & FI_REMOTE_CQ_DATA)
+				signals++;
+		if (now() > deadline) {
+			printf("TIMEOUT waiting for the peer\n");
+			return 1;
+		}
+	}
+	if (count_bad(win, src, len, &first)) {
+		printf("MISMATCH in the new window at %zu\n", first);
+		return 1;
+	}
+	printf("NEW WINDOW VERIFIED %zu bytes written by a peer\n", len);
+	fflush(stdout);
+
+	/* keep answering while the peer and target finish */
+	deadline = now() + 1;
+	while (now() < deadline)
+		fi_cq_read(r.cq, NULL, 0);
+
+	CHECK(fi_close(&mr->fid));
+	free(src);
+	free(zero);
+	free(win);
+	return teardown(&r);
+}
+
 static void usage(void)
 {
 	fprintf(stderr,
@@ -664,6 +864,8 @@ static void usage(void)
 		"<len>\n"
 		"       test_rma [-i ifname] -o file [-c chunk] [-q depth] "
 		"pair <size> <peerfile>\n"
+		"       test_rma [-i ifname] cutoff <addr-hex> <key-hex> "
+		"<base> <len> <budget-ms> <dir>\n"
 		"       (-m: FI_AV_MAP, -t secs: timeout)\n");
 }
 
@@ -678,7 +880,7 @@ int main(int argc, char **argv)
 	};
 	int c, ret;
 
-	while ((c = getopt(argc, argv, "i:o:c:q:a:rnmt:")) != -1) {
+	while ((c = getopt(argc, argv, "i:o:c:q:a:rnmz:t:")) != -1) {
 		switch (c) {
 		case 'i': o.ifname = optarg; break;
 		case 'o': o.outfile = optarg; break;
@@ -688,6 +890,7 @@ int main(int argc, char **argv)
 		case 'r': o.reg_src = true; break;
 		case 'n': o.signal = false; break;
 		case 'm': o.av_map = true; break;
+		case 'z': o.snapfile = optarg; break;
 		case 't': o.timeout = atoi(optarg); break;
 		default: usage(); return 2;
 		}
@@ -704,6 +907,11 @@ int main(int argc, char **argv)
 	else if ((argc == 2 || argc == 3) && !strcmp(argv[0], "target"))
 		ret = run_target(&o, strtoull(argv[1], NULL, 0),
 				 argc == 3 ? atoi(argv[2]) : 0);
+	else if (argc == 7 && !strcmp(argv[0], "cutoff"))
+		ret = run_cutoff(&o, argv[1], argv[2],
+				 strtoull(argv[3], NULL, 0),
+				 strtoull(argv[4], NULL, 0), atoi(argv[5]),
+				 argv[6]);
 	else if (argc == 3 && !strcmp(argv[0], "pair"))
 		ret = run_pair(&o, strtoull(argv[1], NULL, 0), argv[2]);
 	else if (argc == 6 && !strcmp(argv[0], "write"))

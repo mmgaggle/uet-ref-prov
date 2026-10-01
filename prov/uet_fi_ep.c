@@ -20,6 +20,10 @@
  * FI_TRANSMIT_COMPLETE requests get as well. The immediate data of
  * fi_writedata() travels with the last segment, posted only after the
  * others completed, so the target sees it after the whole write landed.
+ *
+ * fi_close() discards what is outstanding, without completions: queued
+ * segments are dropped here and uet_ep_abort() drops those in flight,
+ * so nothing of them is sent again once the close has started.
  */
 
 #include <stdlib.h>
@@ -28,6 +32,7 @@
 
 #include "uet_fi.h"
 
+/* waiting for writes at close, only if the PDS cannot discard them */
 #define UETFI_CLOSE_DRAIN_SECS 10
 
 static struct fi_ops_msg uetfi_msg_nosys;
@@ -406,41 +411,52 @@ static int uetfi_ep_close(struct fid *fid)
 {
 	struct uetfi_ep *ep = container_of(fid, struct uetfi_ep, ep_fid.fid);
 	struct uetfi_domain *dom = ep->dom;
+	struct timespec t0, t1;
+	size_t segs = ep->segs_inflight, ops = ep->ops_outstanding;
 	time_t deadline;
 	int ret;
 
-	if (ep->enabled) {
-		/* drop what was not posted; the core refuses to close with
-		 * writes in flight, so wait for those */
-		while (ep->pend_head) {
-			struct uetfi_op *op = ep->pend_head;
+	clock_gettime(CLOCK_MONOTONIC, &t0);
 
-			op->posted = op->len;
-			uetfi_pend_pop(ep);
-			if (!op->segs_out)
-				uetfi_op_finish(ep, op);
-		}
+	/*
+	 * fi_endpoint(3): operations still outstanding when the endpoint is
+	 * closed are discarded, without completions. Writes not yet handed
+	 * to the core go with the endpoint's memory, and the core drops the
+	 * segments in flight: from here on none of them is sent or
+	 * retransmitted. The core endpoint then closes at once.
+	 */
+	ep->pend_head = ep->pend_tail = NULL;
+	ret = uet_ep_abort(ep->h);
+	if (ret == -FI_ENOSYS && ep->enabled) {
+		/* a PDS that cannot abort (UET_PDS=sng): let them finish */
+		UETFI_WARN(FI_LOG_EP_CTRL, "the PDS cannot discard writes; "
+			   "waiting for those in flight\n");
 		deadline = time(NULL) + UETFI_CLOSE_DRAIN_SECS;
 		while (ep->segs_inflight && time(NULL) < deadline) {
 			uetfi_ep_progress(ep);
 			uetfi_ep_drain_rx(ep);
 		}
-		if (ep->segs_inflight)
-			UETFI_WARN(FI_LOG_EP_CTRL, "%zu write segments still "
-				   "in flight\n", ep->segs_inflight);
-	} else {
-		/*
-		 * Closing the core endpoint returns its enabled regions to
-		 * the registered state; enable the bound ones so they can
-		 * be bound to a later endpoint.
-		 */
-		uetfi_mr_enable_bound(ep);
+	} else if (ret && ret != -FI_ENOSYS) {
+		return ret;
 	}
 
-	/* waits one maximum segment lifetime (2 s) answering peers */
+	/*
+	 * Closing the core endpoint returns its enabled regions to the
+	 * registered state, so they can be bound to a later endpoint;
+	 * enable any that were bound but never enabled so they do too.
+	 */
+	if (!ep->enabled)
+		uetfi_mr_enable_bound(ep);
+
 	ret = uet_ep_close(ep->h);
 	if (ret)
 		return ret;
+
+	clock_gettime(CLOCK_MONOTONIC, &t1);
+	UETFI_INFO(FI_LOG_EP_CTRL, "endpoint closed in %ld us, discarding "
+		   "%zu writes (%zu segments in flight)\n",
+		   (long) ((t1.tv_sec - t0.tv_sec) * 1000000 +
+			   (t1.tv_nsec - t0.tv_nsec) / 1000), ops, segs);
 
 	uetfi_mr_detach_ep(ep);
 	if (ep->tx_cq)

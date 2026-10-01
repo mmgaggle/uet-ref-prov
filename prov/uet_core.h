@@ -72,6 +72,7 @@ int uet_ep_bind_cq(uet_ep_handle_t ep_handle, struct fi_cq_attr *attr,
 		   struct fid_cq *cq, uint64_t flags, void *context,
 		   uet_cq_handle_t *cq_handle);
 int uet_ep_enable(uet_ep_handle_t ep_handle);
+int uet_ep_abort(uet_ep_handle_t ep_handle);
 int uet_ep_close(uet_ep_handle_t ep_handle);
 int uet_ep_progress(uet_ep_handle_t ep_handle);
 

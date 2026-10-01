@@ -7,6 +7,9 @@
 #
 #   prov/run_tests.sh setup | run | teardown | all
 #
+# UETFI_TEST_ENV adds environment to every test process, for example
+# UETFI_TEST_ENV="FI_UET_RUDI=0" to run everything over RUD.
+#
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
 UID_=$(id -u)
@@ -44,7 +47,7 @@ inns() {
 	shift
 	sudo ip netns exec "$ns" setpriv --reuid="$UID_" --regid="$GID_" \
 		--init-groups --inh-caps=+net_raw --ambient-caps=+net_raw -- \
-		env FI_PROVIDER_PATH="$DIR" UET_IFNAME=ofi0 "$@"
+		env FI_PROVIDER_PATH="$DIR" UET_IFNAME=ofi0 ${UETFI_TEST_ENV:-} "$@"
 }
 
 wait_file() {
@@ -112,6 +115,44 @@ pair() {
 	result $rc "pair: two endpoints, each initiator and target, 16 MiB each way"
 }
 
+# A write misses its deadline with the target's link down; the writer closes
+# its endpoint and opens a new one on the same domain. Nothing of the cut-off
+# write may land once the link is back, and the new endpoint must both write
+# and take writes into a newly registered window.
+cutoff() {
+	local A K B S A2 K2 B2 S2 rc=0 len=$((4 << 20)) d=$TMP/cut
+	rm -rf "$d" "$TMP/addr"
+	mkdir -p "$d"
+	inns ofi-a "$DIR/test_rma" -o "$TMP/addr" -z "$d/snap" -t 60 target \
+		"$len" 1 > "$TMP/target.log" 2>&1 &
+	local tpid=$!
+	wait_file "$TMP/addr" || { result 1 "cut-off (target)"; return; }
+	read -r A K B S < "$TMP/addr"
+	inns ofi-b "$DIR/test_rma" -t 60 cutoff "$A" "$K" "$B" "$len" 1000 \
+		"$d" > "$TMP/w1.log" 2>&1 &
+	local wpid=$!
+	for i in $(seq 200); do [ -e "$d/ready" ] && break; sleep 0.1; done
+	sudo ip netns exec ofi-a ip link set ofi0 down
+	touch "$d/go"
+	wait_file "$d/win" || rc=1
+	sleep 1		# retransmit timers expire after the close
+	sudo ip netns exec ofi-a ip link set ofi0 up
+	sleep 2		# whatever is still queued lands now
+	touch "$d/snap"
+	sleep 0.5
+	touch "$d/rewrite"
+	read -r A2 K2 B2 S2 < "$d/win"
+	inns ofi-c "$DIR/test_rma" -t 60 write "$A2" "$K2" "$B2" 0 "$len" \
+		> "$TMP/w2.log" 2>&1 || rc=1
+	wait $wpid || rc=1
+	wait $tpid || rc=1
+	grep -a -h "^CUTOFF\|^REOPENED\|^REWROTE\|^NEW WINDOW\|^SNAPSHOT\|^VERIFIED\|^WROTE\|^TIMEOUT\|^FAILED\|^MISMATCH\|^completion error" \
+		"$TMP"/w1.log "$TMP"/target.log "$TMP"/w2.log | sed 's/^/      /'
+	grep -q "^SNAPSHOT 0 of" "$TMP/target.log" || rc=1
+	rm -f "$TMP"/w*.log
+	result $rc "cut-off: fi_close discards a write, a new endpoint carries on"
+}
+
 bad_key() {
 	local A K B S rc
 	rm -f "$TMP/addr"
@@ -143,6 +184,7 @@ run() {
 	scenario "8 MiB, one writer, 100000-byte writes" $((8 << 20)) 1 \
 		-c 100000 -q 8
 	pair
+	cutoff
 	bad_key
 	[ $FAILED = 0 ] && echo "all passed" || echo "some failed"
 	return $FAILED
