@@ -852,6 +852,33 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 		  const void *optval, size_t optlen);
 
 /*
+ * discard everything an endpoint has outstanding, ahead of closing it
+ *
+ * Every operation the endpoint has in flight or queued is dropped: none
+ * of its packets is sent or retransmitted again, and no completion is
+ * reported for it. This is what fi_close() of a libfabric endpoint
+ * requires. Late responses from peers find nothing and are ignored. A
+ * RUD/ROD PDC that loses un-ACK'ed packets is closed with its peer (a
+ * CLOSE command without payload) or, if never established, freed.
+ * Completions already in the endpoint's queues are left for
+ * uet_ep_close() to free.
+ *
+ * The only call to make on the endpoint afterwards is uet_ep_close(),
+ * which then returns at once rather than wait out the maximum segment
+ * lifetime: the endpoint has nothing left for peers to acknowledge, and
+ * PDC state, ACKs included, belongs to the instance, which keeps
+ * answering as long as any of its endpoints makes progress.
+ *
+ * parms:
+ *   ep_handle - handle identifying uet endpoint instance
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_ENOSYS if the packet delivery sublayer (UET_PDS) cannot abort
+ */
+int uet_ep_abort(uet_ep_handle_t ep_handle);
+
+/*
  * called when an endpoint is closed
  *
  * parms:

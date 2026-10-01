@@ -32,6 +32,7 @@ extern int uet_pds_msg_cmpl_ind(struct uet_ep *uet_ep,
 				uet_pds_mode_t mode, uint16_t msg_id);
 extern int uet_pds_progress_rx(struct uet_instance *uet);
 extern void uet_pds_ep_close_wait(struct uet_ep *uet_ep);
+extern void uet_pds_ep_abort(struct uet_ep *uet_ep);
 
 /* PDS stop-n-go implementation (basic) */
 extern int uet_pds_sng_initialize(struct uet_instance *uet);
@@ -75,6 +76,7 @@ int uet_pds_init(struct uet_instance *uet)
 		downcall->progress_tx   = uet_pds_sng_progress_tx;
 		downcall->progress_rx   = uet_pds_sng_progress_rx;
 		downcall->ep_close_wait = uet_pds_sng_ep_close_wait;
+		downcall->ep_abort      = NULL; /* not supported */
 	} else if (strcmp(pds, "pds") == 0) {
 		downcall->initialize    = uet_pds_initialize;
 		downcall->finalize      = uet_pds_finalize;
@@ -85,6 +87,7 @@ int uet_pds_init(struct uet_instance *uet)
 		downcall->progress_tx   = uet_pds_progress_tx;
 		downcall->progress_rx   = uet_pds_progress_rx;
 		downcall->ep_close_wait = uet_pds_ep_close_wait;
+		downcall->ep_abort      = uet_pds_ep_abort;
 	} else {
 		UET_API_ERR("invalid UET_PDS environment variable");
 		return -ENODEV;

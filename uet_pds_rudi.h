@@ -58,4 +58,9 @@ int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 int uet_pds_rudi_rx(struct uet_instance *uet, struct uet_parsed_pkt *pp,
 		    uint8_t *pkt, size_t pkt_len);
 
+/* Drop every outstanding RUDI request of an endpoint without completing it,
+ * so none is retransmitted. A late response finds no request and is ignored.
+ */
+void uet_pds_rudi_ep_abort(struct uet_ep *uet_ep);
+
 #endif /* _UET_PDS_RUDI_H_ */

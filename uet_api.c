@@ -7280,6 +7280,56 @@ int uet_ep_reset(uet_ep_handle_t ep_handle)
 	return FI_SUCCESS;
 }
 
+int uet_ep_abort(uet_ep_handle_t ep_handle)
+{
+	struct uet_ep *uet_ep;
+	struct uet_pds *pds;
+	struct uet_ring *ring;
+	struct uet_tx_desc *tx_desc;
+	struct uet_av_entry *av_entry;
+
+	uet_ep = (struct uet_ep *) ep_handle;
+	pds = &uet_ep->uet_domain->uet->pds;
+
+	if (pds->downcall.ep_abort == NULL)
+		return -FI_ENOSYS;
+
+	pthread_mutex_lock(&uet_ep->data_lock);
+
+	/* PDS first: it still refers to the descriptors as packet handles */
+	pds->downcall.ep_abort(uet_ep);
+
+	/* every message on the tx ring is outstanding, the oldest at the
+	 * tail; retire them as completion would, but post nothing
+	 */
+	ring = &uet_ep->tx_ring;
+	while (!uet_ring_empty(ring)) {
+		tx_desc = ((struct uet_tx_desc_ring_entry *)
+			   ring->base)[ring->tail].tx_desc;
+
+		if (!(tx_desc->desc_flags & (UET_TX_DESC_FLAG_READ_RSP |
+					     UET_TX_DESC_FLAG_RTR_REQ))) {
+			av_entry = (struct uet_av_entry *)
+				   tx_desc->dst_addr_handle;
+			if (tx_desc->pds_mode == UET_PDS_MODE_ROD)
+				uet_inc_av_msg_next_tx_seq_num(av_entry);
+			av_entry->num_active_ops--;
+			uet_ep->num_active_sends--;
+		}
+
+		if (tx_desc->desc_flags & UET_TX_DESC_FLAG_SYNC_REQ)
+			uet_sync_grp_completion_initiator(tx_desc);
+
+		uet_tx_desc_buf_rtr_list_remove(tx_desc);
+		uet_tx_desc_recycle(tx_desc, true); /* removes the tail */
+	}
+
+	uet_ep->aborted = true;
+
+	pthread_mutex_unlock(&uet_ep->data_lock);
+	return FI_SUCCESS;
+}
+
 int uet_ep_close(uet_ep_handle_t ep_handle)
 {
 	struct uet_ep *uet_ep;
@@ -7299,7 +7349,9 @@ int uet_ep_close(uet_ep_handle_t ep_handle)
 	else
 		uet_mr_hash_finalize(uet_ep);
 
-	pds->downcall.ep_close_wait(uet_ep);
+	/* an aborted endpoint has nothing left for peers to acknowledge */
+	if (!uet_ep->aborted)
+		pds->downcall.ep_close_wait(uet_ep);
 
 	uet_ep_hash_remove(uet_ep);
 

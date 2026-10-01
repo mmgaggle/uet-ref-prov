@@ -655,6 +655,7 @@ struct uet_cq {
 struct uet_ep {
 	pthread_mutex_t data_lock;        /* lock for data path thread safety */
 	uet_ep_state_t ep_state;                         /* state of endpoint */
+	bool aborted;      /* uet_ep_abort() discarded its outstanding sends */
 	struct dlist_entry ep_list_entry;              /* endpoint list entry */
 	UT_hash_handle ep_hh;            /* handle for endpoint hash function */
 	struct uet_domain *uet_domain;                /* ptr to domain struct */

@@ -220,6 +220,22 @@ struct uet_ses_to_pds_funcs {
 	 *               being closed
 	 */
 	void (*ep_close_wait)(struct uet_ep *uet_ep);
+
+	/*
+	 * discard the transmit state of an endpoint that is being closed
+	 *   - every packet the endpoint has outstanding is dropped: it is
+	 *     not sent or retransmitted again, and no response or error is
+	 *     passed up for it
+	 *   - a PDC that loses un-ACK'ed packets this way has PSNs the peer
+	 *     will never see, so it is closed (or freed if it was never
+	 *     established) rather than reused
+	 *   - optional: NULL if the PDS cannot abort
+	 *
+	 * parms:
+	 *      uet_ep - ptr to uet endpoint struct for endpoint that is
+	 *               being closed
+	 */
+	void (*ep_abort)(struct uet_ep *uet_ep);
 };
 
 struct uet_pds_to_ses_funcs {

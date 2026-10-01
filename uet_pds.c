@@ -117,6 +117,8 @@ struct uet_pdc_pkt {
 	bool                  needs_clear;
 	bool                  reordered; /* rx_req() upcall called for ROD */
 
+	struct uet_ep        *uet_ep; /* sender, NULL for control packets */
+
 	uint8_t              *ack_buf;
 	int                   ack_buf_len;
 	uint8_t              *ack;
@@ -204,6 +206,7 @@ struct uet_msgid_map {
 	uint16_t        msg_id;
 	UT_hash_handle  msgid_hh; /* hash handle for the PDC */
 	struct uet_pdc *pdc;
+	struct uet_ep  *uet_ep; /* endpoint sending the message */
 };
 
 struct uet_pds_state {
@@ -1075,7 +1078,8 @@ static int uet_pdsm_get_pdc(uint16_t pdc_id,
 }
 
 static int uet_pdsm_map_msgid_pdc(uint16_t msg_id,
-				  struct uet_pdc *pdc)
+				  struct uet_pdc *pdc,
+				  struct uet_ep *uet_ep)
 {
 	struct uet_msgid_map *msgid_map;
 
@@ -1088,6 +1092,7 @@ static int uet_pdsm_map_msgid_pdc(uint16_t msg_id,
 
 	msgid_map->msg_id = msg_id;
 	msgid_map->pdc    = pdc;
+	msgid_map->uet_ep = uet_ep;
 
 	HASH_ADD(msgid_hh, pds_state.pdc_msgid_ht, msg_id,
 		 sizeof(uint16_t), msgid_map);
@@ -2094,6 +2099,7 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	pdc_pkt->msg_id        = msg_id;
 	pdc_pkt->tx_retry_cnt  = 0;
 	pdc_pkt->tx_pkt_handle = tx_pkt_handle;
+	pdc_pkt->uet_ep        = uet_ep;
 	pdc_pkt->tx_pkt_acked  = false;
 	pdc_pkt->flags         = flags;
 	tx_bm_idx = pdc_pkt->psn - pdc->tx_bm_base_psn;
@@ -2108,7 +2114,7 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	}
 
 	if (map_msg_id) {
-		rc = uet_pdsm_map_msgid_pdc(msg_id, pdc);
+		rc = uet_pdsm_map_msgid_pdc(msg_id, pdc, uet_ep);
 		if (rc != 0) {
 			bm_unset(pdc->tx_bm, tx_bm_idx);
 			free(pdc_pkt->pkt_buf);
@@ -4242,5 +4248,127 @@ void uet_pds_ep_close_wait(struct uet_ep *uet_ep)
 			break;
 
 		uet->pds.downcall.progress_rx(uet);
+	}
+}
+
+/*
+ * Retire a PDC that lost un-ACK'ed packets to an endpoint abort. Its PSN
+ * space now has holes the peer will never see filled, so the PDC cannot
+ * carry traffic any more. Every packet it tracks is freed, those of other
+ * endpoints failed up to SES as closing in error would, and the PDC is
+ * closed with the peer: a CLOSE command makes the target clear all PSNs
+ * and free its side. The CLOSE carries no payload. A PDC that was never
+ * established has no peer state to close and is freed.
+ */
+static void uet_pds_pdc_abort(struct uet_instance *uet,
+			      struct uet_pdc *pdc,
+			      struct uet_ep *uet_ep)
+{
+	struct uet_pdc_pkt *pdc_pkt;
+	struct dlist_entry *tmp;
+	int i;
+
+	/* un-ACK'ed packets, on the retransmit list */
+	dlist_foreach_container_safe(&pdc->tx_pkt_list_head,
+				     struct uet_pdc_pkt, pdc_pkt,
+				     node, tmp) {
+		dlist_remove(&pdc_pkt->node);
+
+		if (PSN_IN_MPR(pdc_pkt->psn, pdc->tx_bm_base_psn))
+			bm_unset(pdc->tx_bm,
+				 (pdc_pkt->psn - pdc->tx_bm_base_psn));
+
+		if ((pdc_pkt->uet_ep != uet_ep) && pdc_pkt->tx_pkt_handle &&
+		    uet->pds.upcall.pds_err)
+			uet->pds.upcall.pds_err(pdc_pkt->tx_pkt_handle,
+						UET_PDS_ERR_NONE);
+
+		free(pdc_pkt->ack_buf);
+		free(pdc_pkt->pkt_buf);
+		free(pdc_pkt);
+	}
+
+	/* ACK'ed packets waiting for the window to shift past them */
+	for (i = 0; i < (int) UET_DEFAULT_MP_RANGE; i++) {
+		if (!bm_get(pdc->tx_bm, i, (void **)&pdc_pkt))
+			continue;
+
+		bm_unset(pdc->tx_bm, i);
+		free(pdc_pkt->ack_buf);
+		free(pdc_pkt->pkt_buf);
+		free(pdc_pkt);
+	}
+
+	/* nothing is outstanding, so the window restarts at next_psn */
+	pdc->tx_bm_base_psn = pdc->next_psn;
+	UET_PDS_UPDATE_PSN(pdc->max_cack_psn, pdc->next_psn - 1);
+
+	UET_PDS_WARN("PDC %u retired by endpoint abort", pdc->pdc_id);
+
+	/* the CLOSE command went with the packets */
+	if (pdc->close_started) {
+		uet_pdsm_free_pdc(pdc);
+		return;
+	}
+
+	if (!pdc->is_initiator) {
+		uet_pds_target_pdc_close(uet, pdc);
+		return;
+	}
+
+	if (pdc->state != PDC_STATE_ESTABLISHED) {
+		uet_pdsm_free_pdc(pdc);
+		return;
+	}
+
+	/* no new message may use it; the CLOSE goes out now, or when a
+	 * message of another endpoint still holding the PDC ends */
+	pdc->close_requested = true;
+	uet_pds_initiate_pdc_close(uet, pdc);
+}
+
+void uet_pds_ep_abort(struct uet_ep *uet_ep)
+{
+	struct uet_instance *uet = uet_ep->uet_domain->uet;
+	struct uet_msgid_map *msgid_map, *mtmp;
+	struct uet_pdc *pdc;
+	struct uet_pdc_pkt *pdc_pkt;
+	struct dlist_entry *tmp;
+	bool owns_pkts;
+
+	PDS_GO();
+
+	uet_pds_rudi_ep_abort(uet_ep);
+
+	/* the endpoint's messages stop holding their PDC */
+	HASH_ITER(msgid_hh, pds_state.pdc_msgid_ht, msgid_map, mtmp) {
+		if (msgid_map->uet_ep != uet_ep)
+			continue;
+
+		pdc = msgid_map->pdc;
+		if (pdc->active_msg_id_valid &&
+		    (pdc->active_msg_id == msgid_map->msg_id)) {
+			pdc->active_msg_id = 0;
+			pdc->active_msg_id_valid = false;
+		}
+
+		HASH_DELETE(msgid_hh, pds_state.pdc_msgid_ht, msgid_map);
+		free(msgid_map);
+	}
+
+	/* PDCs with un-ACK'ed packets of the endpoint */
+	dlist_foreach_container_safe(&pds_state.pdc_alloc_head,
+				     struct uet_pdc, pdc, node, tmp) {
+		owns_pkts = false;
+		dlist_foreach_container(&pdc->tx_pkt_list_head,
+					struct uet_pdc_pkt, pdc_pkt, node) {
+			if (pdc_pkt->uet_ep == uet_ep) {
+				owns_pkts = true;
+				break;
+			}
+		}
+
+		if (owns_pkts)
+			uet_pds_pdc_abort(uet, pdc, uet_ep);
 	}
 }
