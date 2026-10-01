@@ -3272,16 +3272,45 @@ static size_t gather_iov_to_flat(
 /*
  * Translate a dma address to something this process can dereference.
  *
- * FIXME: For future use with a device model does not own the memory its page
- * lists describe and only the device model can resolve them...
+ * When the instance runs in the address space that owns the memory, a dma
+ * address is a process address. A device model does not own the memory its
+ * page lists describe, so it installs a translator (uet_set_dma_translate())
+ * and only it can resolve them. write says whether the caller will store
+ * through the pointer, so that a translator can check permissions and track
+ * dirty pages.
+ *
+ * Callers never ask for a range that crosses a page of the region being
+ * resolved, so a translator only ever has to map memory that is contiguous
+ * in its own address space.
  */
 static void *uet_dma_to_host(const struct uet_instance *uet,
-			     uet_dma_addr_t addr, size_t len)
+			     uet_dma_addr_t addr, size_t len, bool write)
 {
-	(void)uet;
-	(void)len;
+	if (uet->dma_translate != NULL)
+		return uet->dma_translate(uet->dma_translate_ctx, addr, len,
+					  write);
 
 	return (void *)(uintptr_t)addr;
+}
+
+/*
+ * read one entry of a page list directory
+ *
+ * returns false if the entry cannot be translated
+ */
+static bool uet_pbl_dir_entry(const struct uet_instance *uet,
+			      uet_dma_addr_t dir, size_t idx,
+			      uet_dma_addr_t *entry)
+{
+	const uet_dma_addr_t *p;
+
+	p = uet_dma_to_host(uet, (dir + (idx * sizeof(uet_dma_addr_t))),
+			    sizeof(uet_dma_addr_t), false);
+	if (p == NULL)
+		return false;
+
+	memcpy(entry, p, sizeof(*entry));
+	return true;
 }
 
 /*
@@ -3295,18 +3324,19 @@ static void *uet_dma_to_host(const struct uet_instance *uet,
  *   offset  - byte offset into the region's flattened address space
  *   run_len - set to the number of bytes contiguously accessible from the
  *             returned address, never crossing a page boundary
+ *   write   - true when the caller will store through the result
  *
  * returns:
  *   a dereferenceable pointer, or NULL if the offset cannot be resolved
  */
 static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
-				size_t offset, size_t *run_len)
+				size_t offset, size_t *run_len, bool write)
 {
 	const struct uet_mr_desc_pbl *pbl = &mr_desc->buf_desc.pbl;
 	const struct uet_instance *uet = mr_desc->uet_dom->uet;
 	size_t abs, page_idx, page_off, per_dir, dir_idx, ent_idx;
 	uet_dma_addr_t page_addr;
-	uet_dma_addr_t *dir;
+	uet_dma_addr_t dir;
 
 	abs = ((size_t)pbl->page_offset + offset);
 	page_idx = (abs >> pbl->page_shift);
@@ -3315,15 +3345,21 @@ static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
 	switch (pbl->level) {
 	case UET_PBL_LEVEL_0:
 		*run_len = (mr_desc->buf_desc.len - offset);
-		return uet_dma_to_host(uet, (pbl->root + abs), *run_len);
+
+		/*
+		 * The pages are contiguous on the bus but a translator maps
+		 * a page at a time, so do not hand it more than one.
+		 */
+		if ((uet->dma_translate != NULL) &&
+		    (*run_len > ((size_t)pbl->page_size - page_off)))
+			*run_len = ((size_t)pbl->page_size - page_off);
+
+		return uet_dma_to_host(uet, (pbl->root + abs), *run_len,
+				       write);
 
 	case UET_PBL_LEVEL_1:
-		dir = uet_dma_to_host(uet, pbl->root,
-				      ((page_idx + 1) * sizeof(*dir)));
-		if (dir == NULL)
+		if (!uet_pbl_dir_entry(uet, pbl->root, page_idx, &page_addr))
 			return NULL;
-
-		page_addr = dir[page_idx];
 		break;
 
 	case UET_PBL_LEVEL_2:
@@ -3331,16 +3367,11 @@ static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
 		dir_idx = (page_idx / per_dir);
 		ent_idx = (page_idx % per_dir);
 
-		dir = uet_dma_to_host(uet, pbl->root,
-				      ((dir_idx + 1) * sizeof(*dir)));
-		if (dir == NULL)
+		if (!uet_pbl_dir_entry(uet, pbl->root, dir_idx, &dir))
 			return NULL;
 
-		dir = uet_dma_to_host(uet, dir[dir_idx], pbl->page_size);
-		if (dir == NULL)
+		if (!uet_pbl_dir_entry(uet, dir, ent_idx, &page_addr))
 			return NULL;
-
-		page_addr = dir[ent_idx];
 		break;
 
 	default:
@@ -3348,7 +3379,7 @@ static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
 	}
 
 	*run_len = ((size_t)pbl->page_size - page_off);
-	return uet_dma_to_host(uet, (page_addr + page_off), *run_len);
+	return uet_dma_to_host(uet, (page_addr + page_off), *run_len, write);
 }
 
 /*
@@ -3364,7 +3395,7 @@ static size_t uet_mr_pbl_copy(const struct uet_mr_desc *mr_desc, size_t offset,
 	size_t done = 0;
 
 	while (done < len) {
-		p = uet_mr_pbl_resolve(mr_desc, (offset + done), &run);
+		p = uet_mr_pbl_resolve(mr_desc, (offset + done), &run, into_mr);
 		if (p == NULL)
 			break;
 
@@ -3608,7 +3639,8 @@ static void *uet_mr_atomic_addr(const struct uet_mr_desc *mr_desc,
 	}
 
 	case UET_MR_BUF_TYPE_PBL:
-		p = uet_mr_pbl_resolve(mr_desc, offset, &run);
+		/* an atomic reads and writes its operand */
+		p = uet_mr_pbl_resolve(mr_desc, offset, &run, true);
 		break;
 
 	default:
@@ -6605,6 +6637,20 @@ err_return:
 	if (uet != NULL)
 		free(uet);
 	return rc;
+}
+
+int uet_set_dma_translate(uet_handle_t handle, uet_dma_translate_t translate,
+			  void *ctx)
+{
+	struct uet_instance *uet = (struct uet_instance *) handle;
+
+	if (uet == NULL)
+		return -FI_EINVAL;
+
+	uet->dma_translate = translate;
+	uet->dma_translate_ctx = (translate != NULL) ? ctx : NULL;
+
+	return FI_SUCCESS;
 }
 
 int uet_finalize(uet_handle_t handle)

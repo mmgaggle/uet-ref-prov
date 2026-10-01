@@ -583,6 +583,8 @@ struct uet_instance {
 	struct uet_tx_rtr_token_cb tx_rtr_token_cb;
 	struct uet_rw_lock ep_lkup_lock;            /* lock for ep lookup tbl */
 	struct uet_ep *ep_hash_table;                  /* endpoint hash table */
+	uet_dma_translate_t dma_translate;     /* NULL => dma addr is a VA */
+	void *dma_translate_ctx;              /* passed to dma_translate() */
 };
 
 /* memory region descriptor allocation control block struct */
