@@ -393,6 +393,7 @@ int uet_nic_initialize(struct uet_nic *nic)
 		nic->nic_rx_poll     = ext_shim_ops->nic_rx_poll;
 		nic->nic_finalize    = ext_shim_ops->nic_finalize;
 		nic->nic_initialize  = ext_shim_ops->nic_initialize;
+		nic->nic_resolve_nh  = ext_shim_ops->nic_resolve_nh;
 		nic->shim_ctx        = ext_shim_ctx;
 		nic->sock_fd         = -1;
 

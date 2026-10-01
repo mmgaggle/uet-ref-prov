@@ -6036,8 +6036,9 @@ static ssize_t uet_send_req_api_common(
 
 	/* check next-hop mac address */
 	if (!(av_entry->flags & UET_NH_MAC_ADDR_V)) {
-		rc = uet_nic_get_ipv4_nh(UET_NIC(uet), av_entry->addr->fa.v4,
-					 av_entry->nh_mac_addr);
+		rc = uet_nic_get_nh(UET_NIC(uet), &av_entry->addr->fa,
+				    uet_addr_is_ipv6(av_entry->addr),
+				    av_entry->nh_mac_addr);
 		if (rc != FI_SUCCESS)
 			return rc;
 		av_entry->flags |= UET_NH_MAC_ADDR_V;
