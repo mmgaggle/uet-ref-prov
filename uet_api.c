@@ -1237,6 +1237,20 @@ static void uet_tx_desc_ring_rotate(struct uet_tx_desc *tail_tx_desc)
 /* insert entry into list of available rx descriptors for an endpoint */
 static void uet_rx_desc_list_insert(struct uet_rx_desc *rx_desc)
 {
+	/* release a vector or segment list this descriptor copied for itself
+	 * before the flags that record its ownership are cleared
+	 */
+	if (rx_desc->desc_flags & UET_RX_DESC_FLAG_OWNS_IOV) {
+		free((struct iovec *)rx_desc->buf_desc.iov.iov);
+		rx_desc->buf_desc.iov.iov = NULL;
+	}
+
+	if (rx_desc->desc_flags & UET_RX_DESC_FLAG_OWNS_SEG) {
+		free(rx_desc->buf_desc.seg.seg);
+		rx_desc->buf_desc.seg.seg = NULL;
+		rx_desc->buf_desc.seg.seg_count = 0;
+	}
+
 	rx_desc->desc_flags = UET_RX_DESC_FLAG_NONE;
 	dlist_insert_head(&rx_desc->list_entry,
 			  &rx_desc->uet_ep->rx_desc_list_head);
@@ -5444,6 +5458,25 @@ static void *gather_iov_to_buffer(
 	return pkt_buf;
 }
 
+/*
+ * Fail a message that could not be sent in full.
+ *
+ * Once a packet of the message is on the wire, the PDS has mapped the
+ * message id to a PDC and made it that PDC's active message, and only the
+ * end of the message, or a completion indication, clears that. So a
+ * message failed part way has to go through ERR, which waits for the packets
+ * already sent and then gives the PDS its completion indication. Completing
+ * it at once left the PDC with an active message that never ended, and
+ * every later message to the same peer waited behind it forever.
+ */
+static void uet_tx_msg_fail(struct uet_tx_desc *tx_desc, int err_code)
+{
+	uet_tx_desc_set_err(tx_desc, err_code,
+			    tx_desc->transmitted ?
+				UET_TX_DESC_STATE_ERR :
+				UET_TX_DESC_STATE_ERR_COMPLETE);
+}
+
 /* uet message transmission */
 static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 {
@@ -5534,8 +5567,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			if (!pkt_buf) {
 				UET_API_ERR("TX: Failed to gather segments");
 				rc = -FI_ENOMEM;
-				uet_tx_desc_set_err(tx_desc, -rc,
-					UET_TX_DESC_STATE_ERR_COMPLETE);
+				uet_tx_msg_fail(tx_desc, -rc);
 				goto exit;
 			}
 		} else if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
@@ -5549,8 +5581,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 				UET_API_ERR("TX: Msg Buffer is null");
 				UET_API_ERR("TX: Failed to gather iov");
 				rc = -FI_ENOMEM;
-				uet_tx_desc_set_err(tx_desc, -rc,
-					UET_TX_DESC_STATE_ERR_COMPLETE);
+				uet_tx_msg_fail(tx_desc, -rc);
 				goto exit;
 			}
 
@@ -5587,8 +5618,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			flags &= ~UET_PDS_FLAG_SOM;
 		} else {
 			if (rc != -FI_EAGAIN)
-				uet_tx_desc_set_err(tx_desc, -rc,
-					UET_TX_DESC_STATE_ERR_COMPLETE);
+				uet_tx_msg_fail(tx_desc, -rc);
 			break;
 		}
 	}
