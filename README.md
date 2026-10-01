@@ -67,9 +67,11 @@ The `pds` backend (`UET_PDS=pds`) supports all four UET PDS delivery modes:
 - **RUDI** - Reliable Unordered Delivery for Idempotent operations. A
   connectionless mode: no PDC, non-sequential per-packet ids, one response per
   request (no ACK), and all reliability state at the initiator (per-packet RTO).
-  Used for idempotent RMA. Selected by setting `UET_FORCE_RUDI=1` on the `rma`
-  command and it requires the target memory region to be `IDEMPOTENT_SAFE` as
-  well as the peer advertising support for the HPC profile.
+  Used for idempotent RMA. Selected per endpoint with the `UET_OPT_FORCE_RUDI`
+  option of `uet_ep_setopt()`, or for every endpoint by setting
+  `UET_FORCE_RUDI=1` (as on the `rma` command), and it requires the target
+  memory region to be `IDEMPOTENT_SAFE` as well as the peer advertising support
+  for the HPC profile.
 - **UUD** - Unreliable Unordered Delivery. A connectionless, best-effort
   single-packet datagram send (no PDC, no ACK, no retransmit - fire and forget).
   Selected by setting `UET_FORCE_UUD=1` on the `uud` command.
@@ -219,7 +221,7 @@ Replace `2` with the desired number of senders.
 - **UET_PDS_MAX_TX_RETRIES** - Max number of times a Tx packet is retransmitted before failing (default=`5`).
 - **UET_NUM_ITERATIONS** - Override the number of message iterations the test app runs (default=`100`). Used to wall-clock-size a run (e.g., long enough to span several TSS key rotations).
 - **UET_MSG_SIZE** - Override the message size used by the test app (default=`4096`).
-- **UET_FORCE_RUDI** - [ `0` | `1` ] (default=`0`) Force the RUDI (Reliable Unordered Delivery for Idempotent operations) PDS delivery mode for RMA read/write operations.
+- **UET_FORCE_RUDI** - [ `0` | `1` ] (default=`0`) Force the RUDI (Reliable Unordered Delivery for Idempotent operations) PDS delivery mode for RMA read/write operations. This is the default for new endpoints; `uet_ep_setopt(UET_OPT_FORCE_RUDI)` overrides it per endpoint.
 - **UET_FORCE_UUD** - [ `0` | `1` ] (default=`0`) Force the UUD (Unreliable Unordered Delivery) best-effort single-packet datagram PDS delivery mode for an untagged send.
 - **UET_SEC_MODE** - [ `direct` | `cluster` | `server` ]
 - **UET_SEC_SSI** - The SSI to be used for crypto operations. This value must be unique for all instances of `uet`. If not set the source IP address will be used instead as the source identifier.

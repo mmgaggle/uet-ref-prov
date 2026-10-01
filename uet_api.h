@@ -894,6 +894,20 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 		  const void *optval, size_t optlen);
 
 /*
+ * Provider specific FI_OPT_ENDPOINT options for uet_ep_setopt().
+ *
+ * UET_OPT_FORCE_RUDI (bool)
+ *   Carry RMA writes without immediate data, and RMA reads, over the RUDI
+ *   delivery mode instead of RUD/ROD, provided the remote key is
+ *   IDEMPOTENT_SAFE and the peer advertises the HPC profile; otherwise the
+ *   operation falls back to the endpoint's normal mode. The choice is made
+ *   when an operation is posted, so changing the option between posts
+ *   selects the mode per operation. Defaults to whether UET_FORCE_RUDI is
+ *   set in the environment when the endpoint is created.
+ */
+#define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
+
+/*
  * called when an endpoint is closed
  *
  * parms:

@@ -6274,10 +6274,10 @@ static ssize_t uet_send_req_api_common(
 	tx_desc->backoff_max = UET_INITIAL_BACKOFF_MAX;
 	tx_desc->pds_mode = uet_get_pds_mode(uet_ep, rma_op);
 
-	/* force RUDI when UET_FORCE_RUDI is set only for WRITE/READ */
+	/* force RUDI when the endpoint asks for it, only for WRITE/READ */
 	if ((((send_req_api == UET_WRITE_API) && (imm_data == NULL)) ||
 	     (send_req_api == UET_READ_API)) &&
-	    getenv("UET_FORCE_RUDI") &&
+	    uet_ep->force_rudi &&
 	    (remote_key & UET_MR_KEY_IDEMPOTENT_SAFE) &&
 	    (av_entry->addr->fep_cap & UET_FEP_CAP_HPC))
 		tx_desc->pds_mode = UET_PDS_MODE_RUDI;
@@ -7083,6 +7083,9 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 	}
 #endif
 	memcpy(&uet_ep->ip_addr, &uet_ep->uet_addr.fa, sizeof(struct uet_fa));
+
+	/* the environment sets the default, uet_ep_setopt() can change it */
+	uet_ep->force_rudi = (getenv("UET_FORCE_RUDI") != NULL);
 
 	uet_ep->num_rx_desc = info->rx_attr->size;
 	uet_ep->rx_desc = calloc(uet_ep->num_rx_desc,
@@ -8911,7 +8914,24 @@ int uet_ep_control(uet_ep_handle_t ep_handle, int command, void *arg)
 int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 		  const void *optval, size_t optlen)
 {
-	return -FI_ENOSYS;
+	struct uet_ep *uet_ep = (struct uet_ep *) ep_handle;
+
+	if ((uet_ep == NULL) || (level != FI_OPT_ENDPOINT))
+		return -FI_ENOSYS;
+
+	switch (optname) {
+	case UET_OPT_FORCE_RUDI:
+		if ((optval == NULL) || (optlen != sizeof(bool)))
+			return -FI_EINVAL;
+
+		pthread_mutex_lock(&uet_ep->data_lock);
+		uet_ep->force_rudi = *(const bool *)optval;
+		pthread_mutex_unlock(&uet_ep->data_lock);
+		return FI_SUCCESS;
+
+	default:
+		return -FI_ENOSYS;
+	}
 }
 
 int uet_cntr_read(uet_cntr_handle_t cntr_handle, uint64_t *value)

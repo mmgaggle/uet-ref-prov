@@ -697,6 +697,7 @@ struct uet_ep {
 	uint32_t job_id;                                /* ses job identifier */
 	uint16_t entropy;             /* stable endpoint entropy value (EV) */
 	bool absolute;       /* endpoint uses absolute addressing (any JobID) */
+	bool force_rudi;      /* idempotent RMA goes RUDI, UET_OPT_FORCE_RUDI */
 			     /* relative endpoints demux/authorize by JobID   */
 	uint8_t untagged_gen;            /* ses generation for untagged msg's */
 	bool untagged_gen_disabled;  /* true=>gen disabled for untagged msg's */
