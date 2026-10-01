@@ -1,0 +1,6 @@
+{
+	global:
+		fi_prov_ini;
+	local:
+		*;
+};

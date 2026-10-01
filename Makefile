@@ -3,8 +3,11 @@ CC=gcc
 CLANG=clang
 
 # Auto-discover libfabric directory by searching up parent directories
-# Use LIBFABRIC environment variable if set, otherwise auto-discover
-ifneq ($(MAKECMDGOALS),clean)
+# Use LIBFABRIC environment variable if set, otherwise auto-discover.
+# Not needed for clean or for the libfabric provider in prov/, which builds
+# against the installed libfabric.
+NO_LIBFABRIC_GOALS := clean prov prov-clean
+ifneq ($(if $(MAKECMDGOALS),$(filter-out $(NO_LIBFABRIC_GOALS),$(MAKECMDGOALS)),all),)
 ifndef LIBFABRIC
 LIBFABRIC := $(shell \
 	current_dir=$(CURDIR); \
@@ -204,6 +207,13 @@ $(CC_SIM_BIN): $(CC_SIM_OBJ)
 	@echo 'Building program: $@'
 	@$(CC) $(CC_SIM_OBJ) -o $@ $(LDFLAGS)
 
+# libfabric DL provider "uet" (prov/libuet-fi.so), see prov/README.md
+prov:
+	@$(MAKE) -C prov
+
+prov-clean:
+	@$(MAKE) -C prov clean
+
 clean:
 	@rm -rf $(FABRIC_LIB_OBJ_DIR) $(FABRIC_LIB) \
 		$(VERBS_LIB_OBJ_DIR) $(VERBS_LIB) \
@@ -214,4 +224,4 @@ clean:
 		$(XDP_KERN_BIN) \
 		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN)
 
-.PHONY: all xdp strict-core cc_sim clean
+.PHONY: all xdp strict-core cc_sim clean prov prov-clean
