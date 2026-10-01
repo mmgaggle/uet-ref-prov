@@ -349,6 +349,33 @@ extern void nic_xdp_finalize(struct uet_nic *nic);
 extern int nic_xdp_initialize(struct uet_nic *nic);
 #endif
 
+/* the application supplied shim, see uet_nic_register_shim() */
+static const struct uet_nic_shim_ops *ext_shim_ops;
+static void *ext_shim_ctx;
+
+int uet_nic_register_shim(const struct uet_nic_shim_ops *ops, void *ctx)
+{
+	if (ops == NULL) {
+		ext_shim_ops = NULL;
+		ext_shim_ctx = NULL;
+		return 0;
+	}
+
+	if ((ops->name == NULL) || (ops->name[0] == '\0') ||
+	    (ops->nic_initialize == NULL) || (ops->nic_finalize == NULL) ||
+	    (ops->nic_getinfo == NULL) || (ops->nic_tx_pkt == NULL) ||
+	    (ops->nic_rx_pkt == NULL) || (ops->nic_rx_poll == NULL))
+		return -EINVAL;
+
+	if ((strcmp(ops->name, "rawsock") == 0) ||
+	    (strcmp(ops->name, "xdp") == 0))
+		return -EEXIST;
+
+	ext_shim_ops = ops;
+	ext_shim_ctx = ctx;
+	return 0;
+}
+
 /* init nic resources */
 int uet_nic_initialize(struct uet_nic *nic)
 {
@@ -356,6 +383,21 @@ int uet_nic_initialize(struct uet_nic *nic)
 
 	/* get interface name from environment variable */
 	nic_shim = getenv(UET_NIC_SHIM);
+
+	/* a registered shim is the default, and is also selectable by name */
+	if ((ext_shim_ops != NULL) &&
+	    ((nic_shim == NULL) || (strcmp(nic_shim, ext_shim_ops->name) == 0))) {
+		nic->nic_getinfo     = ext_shim_ops->nic_getinfo;
+		nic->nic_tx_pkt      = ext_shim_ops->nic_tx_pkt;
+		nic->nic_rx_pkt      = ext_shim_ops->nic_rx_pkt;
+		nic->nic_rx_poll     = ext_shim_ops->nic_rx_poll;
+		nic->nic_finalize    = ext_shim_ops->nic_finalize;
+		nic->nic_initialize  = ext_shim_ops->nic_initialize;
+		nic->shim_ctx        = ext_shim_ctx;
+		nic->sock_fd         = -1;
+
+		return nic->nic_initialize(nic);
+	}
 
 #if ENABLE_XDP
 	/* for an XDP build, make its shim the default */

@@ -79,6 +79,7 @@ struct uet_nic {
 
 	int sock_fd;                    /* socket fd for ioctl calls */
 	void *nic_priv_data;
+	void *shim_ctx;     /* context given to uet_nic_register_shim() */
 
 	/* function pointers supporting different NIC interfaces */
 	int (*nic_getinfo)(struct uet_nic *nic,
@@ -95,6 +96,62 @@ struct uet_nic {
 	void (*nic_finalize)(struct uet_nic *nic);
 	int (*nic_initialize)(struct uet_nic *nic);
 };
+
+/*
+ * A NIC shim supplied by the application rather than built into the library.
+ *
+ * This is for a device model that carries UET frames over a transport of its
+ * own, for example an emulated NIC that owns a TAP interface and must keep
+ * every packet on the thread that services its guest. The library cannot
+ * know about such a transport, so the device model hands over the callbacks
+ * the built-in shims provide.
+ *
+ * The callbacks have the same contracts as the struct uet_nic members of the
+ * same name. nic_initialize() must fill in the addressing and size fields of
+ * struct uet_nic (ifname, network_type, mac_addr, mac_addr_str, ipv4_addr,
+ * has_ipv4, ipv6_addr, has_ipv6, mtu, l2_hdr_size, min_pkt_size,
+ * min_ip_pkt_size, max_pkt_size) exactly as the built-in shims do. The
+ * context given at registration is available to every callback as
+ * nic->shim_ctx.
+ */
+struct uet_nic_shim_ops {
+	const char *name;                     /* matched against UET_NIC_SHIM */
+	int (*nic_initialize)(struct uet_nic *nic);
+	void (*nic_finalize)(struct uet_nic *nic);
+	int (*nic_getinfo)(struct uet_nic *nic,
+			   struct uet_nic_info *nic_info);
+	int (*nic_tx_pkt)(struct uet_nic *nic,
+			  void *pkt,
+			  void *iphdr,
+			  size_t pkt_size);
+	int (*nic_rx_pkt)(struct uet_nic *nic,
+			  void *pkt,
+			  size_t pkt_buf_size,
+			  size_t *rx_pkt_size);
+	int (*nic_rx_poll)(struct uet_nic *nic);
+};
+
+/*
+ * register an application supplied NIC shim
+ *
+ * Must be called before uet_initialize(). The shim is used when the
+ * UET_NIC_SHIM environment variable names it, or when UET_NIC_SHIM is not
+ * set, so registering a shim makes it the default. One external shim can be
+ * registered at a time, and the registration lasts until it is replaced or
+ * cleared. The ops structure is referenced, not copied, and must outlive
+ * every instance that uses it.
+ *
+ * parms:
+ *      ops - shim callbacks, or NULL to clear the registration
+ *      ctx - opaque context made available to the callbacks as
+ *            nic->shim_ctx
+ *
+ * returns:
+ *      0 on success
+ *      -EINVAL if a required callback is missing
+ *      -EEXIST if the name is that of a built-in shim
+ */
+int uet_nic_register_shim(const struct uet_nic_shim_ops *ops, void *ctx);
 
 /*********************************************************************
  * NIC APIs

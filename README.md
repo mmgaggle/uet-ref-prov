@@ -211,7 +211,7 @@ Replace `2` with the desired number of senders.
 
 - **LD_LIBRARY_PATH** - Needed for dynamic linking to the `libfabric` and `libuet` libraries.
 - **UET_IFNAME** - The ifname of the interface to attach to.
-- **UET_NIC_SHIM** - [ `rawsock` | `xdp` ]
+- **UET_NIC_SHIM** - [ `rawsock` | `xdp` | *name of a registered shim* ] A device model can supply its own shim with `uet_nic_register_shim()` (see `nic_shim/uet_nic.h`); a registered shim is the default when this is not set.
 - **UET_PDS** - [ `sng` | `pds` ] (default=`sng` stop-n-go)
 - **UET_PDS_PER_PKT_ACK_ENB** - [ `0` | `1` ] (default=`0`)
 - **UET_PDS_ACK_TYPE** - [ `ack` | `ack_cc` | `ack_ccx` ] (default=`ack`)
