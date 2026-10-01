@@ -182,12 +182,12 @@ bool uet_pds_rx_pkt_chk(struct uet_instance *uet,
 			return false;
 		}
 
-		if (ipv4->tot_len < htons(uet->nic.min_ip_pkt_size)) {
+		if (ntohs(ipv4->tot_len) < uet->nic.min_ip_pkt_size) {
 			UET_PDS_WARN("IPv4 total length too small");
 			return false;
 		}
 
-		if (ipv4->tot_len > htons((pkt_size - uet->nic.l2_hdr_size))) {
+		if (ntohs(ipv4->tot_len) > (pkt_size - uet->nic.l2_hdr_size)) {
 			UET_PDS_WARN("IPv4 total length too large");
 			return false;
 		}
