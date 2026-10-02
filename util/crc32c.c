@@ -22,10 +22,18 @@
  * Broadcom refers to Broadcom Limited and/or its subsidiaries.
  */
 
+#include <stddef.h>
 #include <stdint.h>
+#include <string.h>
+#include <pthread.h>
 #include <arpa/inet.h>
 
 #include "crc32c.h"
+
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#include <nmmintrin.h>
+#define CRC32C_HAVE_SSE42 1
+#endif
 
 /*
  * This is the CRC-32C table
@@ -103,25 +111,192 @@ static const uint32_t crc32c_table[256] = {
 	0xBE2DA0A5L, 0x4C4623A6L, 0x5F16D052L, 0xAD7D5351L
 };
 
-/*
- * Steps through buffer one byte at at time, calculates reflected
- * crc using table.
- */
-
 uint32_t crc32c_init(void)
 {
 	return ~0;
 }
 
-uint32_t crc32c_update(uint32_t crc,
-		       const uint8_t *data,
-		       uint32_t length)
+/*
+ * Steps through buffer one byte at at time, calculates reflected
+ * crc using table. This is the portable implementation, and the one
+ * every other is checked against.
+ */
+uint32_t crc32c_update_sw(uint32_t crc,
+			  const uint8_t *data,
+			  uint32_t length)
 {
 	while (length--)
 		crc = crc32c_table[(crc ^ *data++) & 0xFFL] ^ (crc >> 8);
 
 	return crc;
 }
+
+#ifdef CRC32C_HAVE_SSE42
+
+/*
+ * SSE4.2 has an instruction for exactly this CRC (CRC32 computes CRC-32C,
+ * reflected, on 1 to 8 bytes at a time). One instruction has a latency of
+ * three cycles and a throughput of one per cycle, so a long buffer is cut
+ * into three streams that are computed together, and the three CRCs are
+ * then combined, as the Linux kernel and isa-l do. Combining shifts a CRC
+ * over the length of the streams after it: CRC register r followed by n
+ * zero bytes is r * x^(8n) modulo the polynomial, a linear map that is
+ * applied with four 256-entry tables, one per byte of r.
+ *
+ * Streams are CRC32C_LONG bytes for buffers of three of those or more (a
+ * jumbo UET packet), and CRC32C_SHORT for what remains.
+ */
+#define CRC32C_POLY_REFLECTED	0x82f63b78u
+#define CRC32C_LONG		2048u
+#define CRC32C_SHORT		256u
+
+static uint32_t crc32c_long_shift[4][256];
+static uint32_t crc32c_short_shift[4][256];
+static pthread_once_t crc32c_once = PTHREAD_ONCE_INIT;
+static int crc32c_use_sse42;
+
+/* a * b modulo the CRC-32C polynomial, reflected (bit 31 is x^0) */
+static uint32_t crc32c_multmodp(uint32_t a, uint32_t b)
+{
+	uint32_t m = 1u << 31;
+	uint32_t p = 0;
+
+	for (;;) {
+		if (a & m) {
+			p ^= b;
+			if ((a & (m - 1)) == 0)
+				break;
+		}
+		m >>= 1;
+		b = (b & 1) ? ((b >> 1) ^ CRC32C_POLY_REFLECTED) : (b >> 1);
+	}
+	return p;
+}
+
+/* x^(8 * n) modulo the polynomial */
+static uint32_t crc32c_x8nmodp(size_t n)
+{
+	uint32_t result = 1u << 31;	/* x^0 */
+	uint32_t power = 1u << 30;	/* x^1 */
+	size_t e = n * 8;
+
+	while (e) {
+		if (e & 1)
+			result = crc32c_multmodp(power, result);
+		power = crc32c_multmodp(power, power);
+		e >>= 1;
+	}
+	return result;
+}
+
+static void crc32c_shift_init(uint32_t tab[4][256], size_t n)
+{
+	uint32_t xn = crc32c_x8nmodp(n);
+	unsigned int k, i;
+
+	for (k = 0; k < 4; k++)
+		for (i = 0; i < 256; i++)
+			tab[k][i] = crc32c_multmodp(xn, (uint32_t)i << (8 * k));
+}
+
+static uint32_t crc32c_shift(const uint32_t tab[4][256], uint32_t crc)
+{
+	return (tab[0][crc & 0xff] ^ tab[1][(crc >> 8) & 0xff] ^
+		tab[2][(crc >> 16) & 0xff] ^ tab[3][crc >> 24]);
+}
+
+static void crc32c_setup(void)
+{
+	if (!__builtin_cpu_supports("sse4.2"))
+		return;
+	crc32c_shift_init(crc32c_long_shift, CRC32C_LONG);
+	crc32c_shift_init(crc32c_short_shift, CRC32C_SHORT);
+	crc32c_use_sse42 = 1;
+}
+
+static inline uint64_t crc32c_load64(const uint8_t *p)
+{
+	uint64_t v;
+
+	memcpy(&v, p, sizeof(v));
+	return v;
+}
+
+/* three streams of 'stream' bytes each, combined with 'tab' */
+#define CRC32C_3WAY(stream, tab)					\
+	while (len >= 3 * (stream)) {					\
+		uint64_t c1 = 0, c2 = 0;				\
+		const uint8_t *end = p + (stream);			\
+									\
+		do {							\
+			c0 = _mm_crc32_u64(c0, crc32c_load64(p));	\
+			c1 = _mm_crc32_u64(c1,				\
+				crc32c_load64(p + (stream)));		\
+			c2 = _mm_crc32_u64(c2,				\
+				crc32c_load64(p + 2 * (stream)));	\
+			p += 8;						\
+		} while (p < end);					\
+		c0 = crc32c_shift(tab, (uint32_t)c0) ^ c1;		\
+		c0 = crc32c_shift(tab, (uint32_t)c0) ^ c2;		\
+		p += 2 * (stream);					\
+		len -= 3 * (stream);					\
+	}
+
+__attribute__((target("sse4.2")))
+static uint32_t crc32c_update_sse42(uint32_t crc, const uint8_t *p,
+				    size_t len)
+{
+	uint64_t c0 = crc;
+
+	while (len && ((uintptr_t)p & 7)) {
+		c0 = _mm_crc32_u8((uint32_t)c0, *p++);
+		len--;
+	}
+
+	CRC32C_3WAY(CRC32C_LONG, crc32c_long_shift)
+	CRC32C_3WAY(CRC32C_SHORT, crc32c_short_shift)
+
+	while (len >= 8) {
+		c0 = _mm_crc32_u64(c0, crc32c_load64(p));
+		p += 8;
+		len -= 8;
+	}
+	while (len--)
+		c0 = _mm_crc32_u8((uint32_t)c0, *p++);
+
+	return (uint32_t)c0;
+}
+
+int crc32c_hw(void)
+{
+	pthread_once(&crc32c_once, crc32c_setup);
+	return crc32c_use_sse42;
+}
+
+uint32_t crc32c_update(uint32_t crc,
+		       const uint8_t *data,
+		       uint32_t length)
+{
+	if (crc32c_hw())
+		return crc32c_update_sse42(crc, data, length);
+	return crc32c_update_sw(crc, data, length);
+}
+
+#else /* !CRC32C_HAVE_SSE42 */
+
+int crc32c_hw(void)
+{
+	return 0;
+}
+
+uint32_t crc32c_update(uint32_t crc,
+		       const uint8_t *data,
+		       uint32_t length)
+{
+	return crc32c_update_sw(crc, data, length);
+}
+
+#endif /* CRC32C_HAVE_SSE42 */
 
 uint32_t crc32c_finish(uint32_t crc)
 {
