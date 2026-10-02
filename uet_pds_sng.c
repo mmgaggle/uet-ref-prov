@@ -109,6 +109,8 @@ static bool uet_pds_ep_addr_match(
 	bool is_ipv6 = uet_pkt_is_ipv6(pkt);
 	size_t ip_hdr_size = (is_ipv6) ? sizeof(struct ipv6hdr) :
 					 sizeof(struct iphdr);
+	size_t encap_len = uet_ip_encap_len((uint8_t *)pkt +
+					    sizeof(struct ethhdr), is_ipv6);
 
 	if (is_ipv6) {
 		struct ipv6hdr *ipv6 =
@@ -131,7 +133,7 @@ static bool uet_pds_ep_addr_match(
 			(struct uet_ses_rsp *)((uint8_t *)pkt +
 					       sizeof(struct ethhdr) +
 					       ip_hdr_size +
-					       sizeof(struct uet_entropy) +
+					       encap_len +
 					       sizeof(struct uet_pds_ack));
 
 		if (!pds_state->tx.tx_active)
@@ -153,7 +155,7 @@ static bool uet_pds_ep_addr_match(
 			(struct uet_ses_rsp_d *)((uint8_t *)pkt +
 						 sizeof(struct ethhdr) +
 						 ip_hdr_size +
-						 sizeof(struct uet_entropy) +
+						 encap_len +
 						 sizeof(struct uet_pds_ack));
 
 		job_id = ((ntohl(ses_rsp_d->cmn.ri_gen_job_id) &
@@ -178,7 +180,7 @@ static bool uet_pds_ep_addr_match(
 			(struct uet_ses_req_std *)((uint8_t *)pkt +
 						   sizeof(struct ethhdr) +
 						   ip_hdr_size +
-						   sizeof(struct uet_entropy) +
+						   encap_len +
 						   sizeof(struct uet_pds_req));
 
 		job_id = ((ntohl(ses_req->cmn.ri_gen_job_id) &
@@ -251,17 +253,19 @@ static bool uet_pds_is_dup_req(struct uet_ep *uet_ep, void *pkt,
 	bool is_ipv6 = uet_pkt_is_ipv6(pkt);
 	size_t ip_hdr_size = (is_ipv6) ? sizeof(struct ipv6hdr) :
 					 sizeof(struct iphdr);
+	size_t encap_len = uet_ip_encap_len((uint8_t *)pkt +
+					    sizeof(struct ethhdr), is_ipv6);
 	/* PDS spdcid offset from start of packet */
 	size_t pds_spdcid_off = (sizeof(struct ethhdr) +
 				 ip_hdr_size +
-				 sizeof(struct uet_entropy) +
+				 encap_len +
 				 sizeof(struct uet_pds_prlg) +
 				 sizeof(uint16_t) + /* clear/ack_psn_offset */
 				 sizeof(uint32_t)); /* psn */
 	/* PDS psn offset from start of packet */
 	size_t pds_psn_off = (sizeof(struct ethhdr) +
 			      ip_hdr_size +
-			      sizeof(struct uet_entropy) +
+			      encap_len +
 			      sizeof(struct uet_pds_prlg) +
 			      sizeof(uint16_t)); /* clear/ack_psn_offset */
 	uint8_t *ack;
@@ -350,28 +354,24 @@ static void uet_pds_build_ack_pkt(struct uet_instance *uet, void *pkt,
 	size_t ip_hdr_size = (is_ipv6) ? sizeof(struct ipv6hdr) :
 					 sizeof(struct iphdr);
 	void *ack_ip = (uint8_t *)ack + sizeof(struct ethhdr);
+	uint8_t *pkt_ip = (uint8_t *)pkt + sizeof(struct ethhdr);
 	struct uet_pds_ack *ack_pds =
 		(struct uet_pds_ack *)((uint8_t *)ack +
 				       sizeof(struct ethhdr) +
 				       ip_hdr_size +
-				       sizeof(struct uet_entropy));
+				       uet_encap_len(uet));
 	struct uet_pds_req *pkt_pds =
-		(struct uet_pds_req *)((uint8_t *)pkt +
-				       sizeof(struct ethhdr) +
-				       ip_hdr_size +
-				       sizeof(struct uet_entropy));
+		(struct uet_pds_req *)(pkt_ip + ip_hdr_size +
+				       uet_ip_encap_len(pkt_ip, is_ipv6));
 	struct uet_pds_hdr_overlay *pkt_overlay, *ack_overlay;
 	void *ack_ses = (uint8_t *)(ack_pds + 1);
-	struct uet_entropy *ack_entropy =
-		(struct uet_entropy *)((uint8_t *)ack +
-				       sizeof(struct ethhdr) +
-				       ip_hdr_size);
+	uint16_t entropy;
 
-	/* copy entropy from request */
-	ack_entropy->entropy =
-		((struct uet_entropy *)((uint8_t *)pkt +
-					sizeof(struct ethhdr) +
-					ip_hdr_size))->entropy;
+	/* copy entropy from request: the first 16 bits after the IP header,
+	 * the UDP source port or the entropy header's entropy */
+	memcpy(&entropy, pkt_ip + ip_hdr_size, sizeof(entropy));
+	uet_build_encap_hdr(uet, (uint8_t *)ack_ip + ip_hdr_size,
+			    ntohs(entropy));
 
 	uet_build_eth_hdr((struct ethhdr *)ack,
 			  ((struct ethhdr *)pkt)->h_source,
@@ -453,14 +453,14 @@ static int uet_pds_tx_ack_pkt(struct uet_ep *uet_ep, void *pkt,
 	if (next_hdr == UET_HDR_RSP)
 		ack_pkt_len = (sizeof(struct ethhdr) +
 			       ip_hdr_size +
-			       sizeof(struct uet_entropy) +
+			       uet_encap_len(uet) +
 			       sizeof(struct uet_pds_ack) +
 			       sizeof(struct uet_ses_rsp));
 	else {
 		ack_data_len = (ses_hdr_len - sizeof(struct uet_ses_rsp_d));
 		ack_pkt_len = (sizeof(struct ethhdr) +
 			       ip_hdr_size +
-			       sizeof(struct uet_entropy) +
+			       uet_encap_len(uet) +
 			       sizeof(struct uet_pds_ack) +
 			       sizeof(struct uet_ses_rsp_d) +
 			       ack_data_len);
@@ -538,7 +538,7 @@ static int uet_pds_tx_err_ack_pkt(struct uet_instance *uet,
 
 	ack_pkt_len = (sizeof(struct ethhdr) +
 		       ip_hdr_size +
-		       sizeof(struct uet_entropy) +
+		       uet_encap_len(uet) +
 		       sizeof(struct uet_pds_ack) +
 		       sizeof(struct uet_ses_rsp));
 
@@ -658,7 +658,6 @@ int uet_pds_sng_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
 	uint8_t *uet_pkt;
 	struct uet_av_entry *av_entry;
 	struct uet_addr *dst_addr;
-	struct uet_entropy *entropy_hdr;
 	struct uet_pds_req *pds;
 	struct uet_pds_sng_tx_state *state;
 	struct uet_pds_hdr_overlay *pds_overlay;
@@ -693,10 +692,8 @@ int uet_pds_sng_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
 
 	uet_build_eth_hdr((struct ethhdr *)uet_pkt, av_entry->nh_mac_addr,
 			  uet->nic.mac_addr, is_ipv6);
-	entropy_hdr = (struct uet_entropy *)(uet_pkt + sizeof(struct ethhdr) +
-						  ip_hdr_size);
-	entropy_hdr->entropy = htons(uet_ep->entropy);
-	entropy_hdr->rsvd = 0;
+	uet_build_encap_hdr(uet, uet_pkt + sizeof(struct ethhdr) + ip_hdr_size,
+			    uet_ep->entropy);
 
 	switch (next_hdr) {
 	case UET_HDR_REQ_STD:
@@ -716,14 +713,14 @@ int uet_pds_sng_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
 
 		uet_hdr_len = (sizeof(struct ethhdr) +
 			       ip_hdr_size +
-			       sizeof(struct uet_entropy) +
+			       uet_encap_len(uet) +
 			       sizeof(struct uet_pds_req) +
 			       ses_len);
 
 		pds = (struct uet_pds_req *)(uet_pkt +
 					     sizeof(struct ethhdr) +
 					     ip_hdr_size +
-					     sizeof(struct uet_entropy));
+					     uet_encap_len(uet));
 		ses_hdr = (void *)(pds + 1);
 		payload = ((uint8_t *)ses_hdr + ses_len);
 		pds->prlg.type_next_flags =

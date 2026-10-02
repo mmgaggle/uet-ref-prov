@@ -157,6 +157,43 @@ typedef void (*uet_eq_err_callback_t)(uet_handle_t handle,
 int uet_initialize(uet_handle_t *handle);
 
 /*
+ * How an instance puts UET on the wire, fixed by uet_initialize():
+ *
+ *   UET_ENCAP        "udp" (the default) puts UET in UDP to UET_UDP_PORT
+ *                    (default 4793), with the entropy in the source port;
+ *                    "ip" puts it directly in IP, protocol UET_IPPROTO
+ *                    (default 253), behind an entropy header. Packets in
+ *                    either form are accepted whatever this says.
+ *   UET_MAX_PAYLOAD  the Payload MTU, 1024, 2048, 4096 or 8192; by default
+ *                    the largest that fits the NIC's MTU (1024 for 1500,
+ *                    8192 for 9000). Every FEP of a fabric must use the
+ *                    same value.
+ *   UET_PDS_ACK_GEN_TRIGGER, UET_PDS_ACK_GEN_MIN_PKT_ADD
+ *                    ACK coalescing, in bytes: by default 16384 and 1024,
+ *                    raised to four and one quarter of a payload for
+ *                    payloads over 4096 (up to the 32 KiB and 2 KiB the
+ *                    specification allows).
+ */
+struct uet_wire_info {
+	uint32_t ip_mtu;	/* the NIC's IP MTU */
+	uint32_t payload_mtu;	/* SES payload bytes in a full packet */
+	bool udp;		/* UET over UDP, else directly over IP */
+	uint16_t udp_port;	/* UDP destination port */
+	uint8_t ipproto;	/* IP protocol, without UDP */
+	uint32_t ack_gen_trigger;
+	uint32_t ack_gen_min_pkt_add;
+};
+
+/*
+ * report how an instance puts UET on the wire
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_EINVAL for a bad handle or a NULL info
+ */
+int uet_get_wire_info(uet_handle_t handle, struct uet_wire_info *info);
+
+/*
  * install a dma address translator
  *
  * Page buffer list regions (uet_mr_reg_pbl()) name their directories and

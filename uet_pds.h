@@ -26,6 +26,9 @@
 #define UET_DEFAULT_PDS_PER_PKT_ACK_ENABLED 0
 #define UET_DEFAULT_PDS_ACK_GEN_MIN_PKT_ADD 1024 /* in bytes */
 #define UET_DEFAULT_PDS_ACK_GEN_PKT_TRIGGER 16384 /* in bytes */
+/* the largest values UEC 1.0.1 Table 3-28 requires (ACK_Gen_*) */
+#define UET_PDS_ACK_GEN_MIN_PKT_ADD_MAX 2048 /* in bytes */
+#define UET_PDS_ACK_GEN_TRIGGER_MAX 32768 /* in bytes */
 
 struct uet_ep;     /* forward references */
 struct uet_instance;

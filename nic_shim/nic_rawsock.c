@@ -163,7 +163,7 @@ void nic_rawsock_finalize(struct uet_nic *nic)
 int nic_rawsock_initialize(struct uet_nic *nic)
 {
 	struct rawsock_data *rdata = NULL;
-	int rc;
+	int rc, rcvbuf;
 	char *ifname;
 
 	nic->min_pkt_size = UET_MIN_PKT_SIZE;
@@ -257,10 +257,22 @@ int nic_rawsock_initialize(struct uet_nic *nic)
 	if ((ioctl(rdata->sock_fd.fd, SIOCGIFMTU, &rdata->ifr)) < 0) {
 		UET_API_PRINT_ERRNO("socket ioctl");
 		UET_API_ERR("Error getting MTU of local device");
+		rc = -EIO;
 		goto err_return;
 	}
 	nic->mtu = (size_t)rdata->ifr.ifr_mtu;
 	nic->max_pkt_size = (nic->mtu + nic->l2_hdr_size);
+
+	/*
+	 * A peer may send a whole RUDI message at once. With jumbo frames
+	 * the default receive buffer (rmem_default, often 208 KiB) holds
+	 * only a couple of dozen of them, so ask for room for 512 full
+	 * packets. The kernel caps this at rmem_max; a smaller buffer only
+	 * means more retransmissions, so a failure is not an error.
+	 */
+	rcvbuf = (int)(512 * nic->max_pkt_size);
+	(void)setsockopt(rdata->sock_fd.fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf,
+			 sizeof(rcvbuf));
 
 	return 0;
 

@@ -171,6 +171,9 @@ void uet_build_ipv6_hdr(struct uet_instance *uet, struct ipv6hdr *ipv6,
 			uint16_t payload_len, uint8_t tc, bool crc_en);
 void uet_update_ipv4_tl(struct iphdr *ipv4, uint16_t tot_len);
 void uet_update_ipv6_pl(struct ipv6hdr *ipv6, uint16_t payload_len);
+size_t uet_encap_len(const struct uet_instance *uet);
+void uet_build_encap_hdr(const struct uet_instance *uet, void *hdr,
+			 uint16_t entropy);
 void uet_build_eth_hdr(struct ethhdr *eth, uint8_t *dmac, uint8_t *smac,
 		       bool is_ipv6);
 void uet_pkt_hex_dump(void *pkt, uint32_t length, uint64_t addr, bool is_tx);

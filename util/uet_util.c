@@ -667,15 +667,19 @@ void uet_build_ipv4_hdr(struct uet_instance *uet, struct iphdr *ipv4,
 	ipv4->id = 0;
 	ipv4->frag_off = htons(UET_IPV4_FRAG_OFF_DF);
 	ipv4->ttl = IPDEFTTL;
-	ipv4->protocol = uet->uet_ipproto;
+	ipv4->protocol = uet->udp_encap ? IPPROTO_UDP : uet->uet_ipproto;
 	ipv4->saddr = sip;
 	ipv4->daddr = dip;
 	ipv4->check = 0;
 	ipv4->check = uet_ipv4_csum(ipv4);
+	if (uet->udp_encap)
+		((struct udphdr *)(ipv4 + 1))->len =
+			htons(ntohs(ipv4->tot_len) - sizeof(*ipv4));
 }
 
 /*
- * update ipv4 total length and checksum fields
+ * update ipv4 total length and checksum fields, and the UDP length when
+ * the packet is UET over UDP
  *
  * parms:
  *      ipv4    - ptr to location where ipv4 header is located
@@ -686,6 +690,9 @@ void uet_update_ipv4_tl(struct iphdr *ipv4, uint16_t tot_len)
 	ipv4->tot_len = htons(tot_len);
 	ipv4->check = 0;
 	ipv4->check = uet_ipv4_csum(ipv4);
+	if (ipv4->protocol == IPPROTO_UDP)
+		((struct udphdr *)(ipv4 + 1))->len =
+			htons(tot_len - sizeof(*ipv4));
 }
 
 /*
@@ -709,14 +716,17 @@ void uet_build_ipv6_hdr(struct uet_instance *uet, struct ipv6hdr *ipv6,
 	ipv6->priority = (tc >> 4);
 	ipv6->flow_lbl[0] = (tc << 4);
 	ipv6->payload_len = htons(payload_len + (crc_en ? CRC_LEN : 0));
-	ipv6->nexthdr = uet->uet_ipproto;
+	ipv6->nexthdr = uet->udp_encap ? IPPROTO_UDP : uet->uet_ipproto;
 	ipv6->hop_limit = IPDEFTTL;
 	memcpy(&ipv6->saddr, sip, 16);
 	memcpy(&ipv6->daddr, dip, 16);
+	if (uet->udp_encap)
+		((struct udphdr *)(ipv6 + 1))->len = ipv6->payload_len;
 }
 
 /*
- * update ipv6 payload length field
+ * update ipv6 payload length field, and the UDP length when the packet is
+ * UET over UDP
  *
  * parms:
  *      ipv6        - ptr to location where ipv6 header is located
@@ -725,6 +735,45 @@ void uet_build_ipv6_hdr(struct uet_instance *uet, struct ipv6hdr *ipv6,
 void uet_update_ipv6_pl(struct ipv6hdr *ipv6, uint16_t payload_len)
 {
 	ipv6->payload_len = htons(payload_len);
+	if (ipv6->nexthdr == IPPROTO_UDP)
+		((struct udphdr *)(ipv6 + 1))->len = htons(payload_len);
+}
+
+/* bytes between the IP header and the PDS (or TSS) header on transmit */
+size_t uet_encap_len(const struct uet_instance *uet)
+{
+	return uet->encap_len;
+}
+
+/*
+ * build the header between the IP header and the PDS (or TSS) header:
+ * UDP, with the entropy in the source port and the checksum 0 (UEC 1.0.1,
+ * 3.5.10.1), or the entropy header when UET runs directly over IP. The
+ * UDP length is not touched here: it is set with the IP length, by
+ * uet_build_ipv4_hdr(), uet_build_ipv6_hdr() and the update functions
+ * above, so the two headers may be built in either order.
+ *
+ * parms:
+ *      uet     - ptr to uet instance struct
+ *      hdr     - where the header goes, right after the IP header
+ *      entropy - the packet's entropy value
+ */
+void uet_build_encap_hdr(const struct uet_instance *uet, void *hdr,
+			 uint16_t entropy)
+{
+	struct uet_entropy *ent;
+	struct udphdr *udp;
+
+	if (uet->udp_encap) {
+		udp = (struct udphdr *)hdr;
+		udp->source = htons(entropy);
+		udp->dest = htons(uet->uet_udp_port);
+		udp->check = 0;
+	} else {
+		ent = (struct uet_entropy *)hdr;
+		ent->entropy = htons(entropy);
+		ent->rsvd = 0;
+	}
 }
 
 /*

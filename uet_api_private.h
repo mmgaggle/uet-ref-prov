@@ -566,6 +566,8 @@ struct uet_instance {
 	struct uet_nic nic;                              /* nic control block */
 	uint8_t uet_ipproto;                    /* ip protocol number for uet */
 	uint16_t uet_udp_port;                     /* udp port number for uet */
+	bool udp_encap;          /* transmit over UDP, else directly over IP */
+	size_t encap_len;      /* udp or entropy header, as udp_encap says */
 	size_t max_payload_len;                   /* max payload for a packet */
 	struct uet_pds pds;			  /* pds control block struct */
 	uint8_t default_msg_ip_tos;               /* default ip tos for msg's */
@@ -722,7 +724,7 @@ struct uet_ack_d_info {
 	     /* Staging area used when the source memory region is described  */
 	     /* by a scatter/gather list, where no contiguous pointer into    */
 	     /* the region exists. buf points here once the data is gathered. */
-	uint8_t gather_buf[UET_DEFAULT_MAX_PAYLOAD_LEN];
+	uint8_t gather_buf[UET_MAX_PAYLOAD_LEN];
 };
 
 #endif /* _UET_API_PRIVATE_H_ */

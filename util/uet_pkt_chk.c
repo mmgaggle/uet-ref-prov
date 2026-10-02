@@ -5,6 +5,7 @@
 
 #include <arpa/inet.h>
 #include <linux/ip.h>
+#include <linux/udp.h>
 
 #include "uet_pkt_chk.h"
 #include "uet_log.h"
@@ -33,7 +34,9 @@ static bool uet_pds_pkt_type_valid(uint8_t *pkt,
 	pds_hdr = (struct uet_pds_req *)(pkt +
 					 sizeof(struct ethhdr) +
 					 ip_hdr_size +
-					 sizeof(struct uet_entropy));
+					 uet_ip_encap_len(pkt +
+							  sizeof(struct ethhdr),
+							  is_ipv6));
 
 	pds_type = ((ntohs(pds_hdr->prlg.type_next_flags) &
 		     UET_PDS_TYPE_MASK) >> UET_PDS_TYPE_SHIFT);
@@ -123,6 +126,24 @@ static bool uet_pds_pkt_type_valid(uint8_t *pkt,
 	return false;
 }
 
+/*
+ * Is this UET, by its IP protocol? Either encapsulation is accepted,
+ * whichever one the instance transmits with (UEC 1.0.1, 3.5.10.1: FEPs
+ * accept both): the configured IP protocol, or UDP to the configured
+ * destination port with room for the UDP header in the IP payload.
+ */
+static bool uet_ip_proto_ok(const struct uet_instance *uet, uint8_t proto,
+			    const void *l4, int l4_len)
+{
+	const struct udphdr *udp = (const struct udphdr *)l4;
+
+	if (proto == uet->uet_ipproto)
+		return true;
+	if (proto != IPPROTO_UDP || l4_len < (int)sizeof(struct udphdr))
+		return false;
+	return ntohs(udp->dest) == uet->uet_udp_port;
+}
+
 bool uet_pds_rx_pkt_chk(struct uet_instance *uet,
 			uint8_t *pkt,
 			size_t pkt_size,
@@ -149,7 +170,11 @@ bool uet_pds_rx_pkt_chk(struct uet_instance *uet,
 			return false;
 		}
 
-		if (ipv6->nexthdr != uet->uet_ipproto) {
+		if (!uet_ip_proto_ok(uet, ipv6->nexthdr, ipv6 + 1,
+				     uet_min((int)ntohs(ipv6->payload_len),
+					     (int)pkt_size -
+					     (int)(sizeof(struct ethhdr) +
+						   sizeof(struct ipv6hdr))))) {
 			UET_PDS_WARN("unsupported IP protocol");
 			return false;
 		}
@@ -177,7 +202,11 @@ bool uet_pds_rx_pkt_chk(struct uet_instance *uet,
 			return false;
 		}
 
-		if (ipv4->protocol != uet->uet_ipproto) {
+		if (!uet_ip_proto_ok(uet, ipv4->protocol, ipv4 + 1,
+				     uet_min((int)ntohs(ipv4->tot_len),
+					     (int)pkt_size -
+					     (int)sizeof(struct ethhdr)) -
+				     (int)sizeof(struct iphdr))) {
 			UET_PDS_WARN("unsupported IP protocol");
 			return false;
 		}

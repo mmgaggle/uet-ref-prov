@@ -809,8 +809,8 @@ static bool imp_shim_mangle_pkt(uint8_t *pkt, size_t iphdr_off,
 	else
 		return false;
 
-	/* the PDS header follows the IP and entropy headers (no UDP here) */
-	pds = ip + ip_hdr_len + sizeof(struct uet_entropy);
+	/* the PDS header follows the IP and the entropy or UDP header */
+	pds = ip + ip_hdr_len + uet_ip_encap_len(ip, (ip_ver == 6));
 	if ((size_t)((pds - pkt) + sizeof(struct uet_pds_req)) > pkt_size)
 		return false;
 

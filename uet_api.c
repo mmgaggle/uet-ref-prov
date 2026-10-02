@@ -30,6 +30,8 @@
  *   - not designed for high performance
  */
 
+#include <errno.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -6596,6 +6598,129 @@ err:
  * Below functions implement UET APIs
  *********************************************************************/
 
+/* an unsigned number from the environment, or false when it is unset */
+static int uet_env_u32(const char *name, uint32_t lo, uint32_t hi,
+		       uint32_t *val)
+{
+	const char *s = getenv(name);
+	unsigned long v;
+	char *end;
+
+	if (s == NULL || *s == '\0')
+		return 0;
+	errno = 0;
+	v = strtoul(s, &end, 0);
+	if (errno != 0 || end == s || *end != '\0' || *s == '-' ||
+	    v < lo || v > hi) {
+		UET_API_ERR("%s must be %u..%u (got '%s')", name, lo, hi, s);
+		return -FI_EINVAL;
+	}
+	*val = (uint32_t)v;
+	return 1;
+}
+
+/*
+ * Encapsulation, Payload MTU and the ACK coalescing that depends on it,
+ * once the NIC (and with it the MTU) is known. See uet_get_wire_info().
+ */
+static int uet_wire_config(struct uet_instance *uet)
+{
+	const char *encap = getenv("UET_ENCAP");
+	uint32_t v, fit;
+	int rc;
+
+	if (encap == NULL || *encap == '\0' || strcmp(encap, "udp") == 0) {
+		uet->udp_encap = true;
+	} else if (strcmp(encap, "ip") == 0) {
+		uet->udp_encap = false;
+	} else {
+		UET_API_ERR("UET_ENCAP must be udp or ip (got '%s')", encap);
+		return -FI_EINVAL;
+	}
+	uet->encap_len = uet->udp_encap ? sizeof(struct udphdr)
+					: sizeof(struct uet_entropy);
+
+	rc = uet_env_u32("UET_UDP_PORT", 1, 65535, &v);
+	if (rc < 0)
+		return rc;
+	if (rc > 0)
+		uet->uet_udp_port = (uint16_t)v;
+
+	rc = uet_env_u32("UET_IPPROTO", 0, 255, &v);
+	if (rc < 0)
+		return rc;
+	if (rc > 0)
+		uet->uet_ipproto = (uint8_t)v;
+	UET_NIC(uet)->uet_ipproto = uet->uet_ipproto;
+
+	fit = uet_payload_mtu_for_ip_mtu((unsigned int)UET_NIC(uet)->mtu);
+	rc = uet_env_u32("UET_MAX_PAYLOAD", UET_PAYLOAD_MTU_MIN,
+			 UET_PAYLOAD_MTU_MAX, &v);
+	if (rc < 0)
+		return rc;
+	if (rc > 0) {
+		if (!uet_payload_mtu_valid(v)) {
+			UET_API_ERR("UET_MAX_PAYLOAD must be 1024, 2048, 4096 "
+				    "or 8192 (got %u)", v);
+			return -FI_EINVAL;
+		}
+		if (v > fit)
+			UET_API_ERR("UET_MAX_PAYLOAD %u: packets with all "
+				    "headers can exceed the MTU of %u", v,
+				    (unsigned int)UET_NIC(uet)->mtu);
+		uet->max_payload_len = v;
+	} else {
+		uet->max_payload_len = fit;
+	}
+
+	/*
+	 * ACK coalescing (UEC 1.0.1, 3.5.12.4.1) counts bytes, so with large
+	 * payloads the default 16 KiB trigger would ACK every other packet.
+	 * Keep at least four packets per ACK, within the 32 KiB the
+	 * specification allows, and a minimum add of 1/16 of the trigger, so
+	 * small packets are still ACK'ed every 16, as with the defaults.
+	 */
+	uet->pds.ack_gen_trigger =
+		uet_max((uint32_t)UET_DEFAULT_PDS_ACK_GEN_PKT_TRIGGER,
+			uet_min((uint32_t)(4 * uet->max_payload_len),
+				(uint32_t)UET_PDS_ACK_GEN_TRIGGER_MAX));
+	uet->pds.ack_gen_min_pkt_add =
+		uet_max((uint32_t)UET_DEFAULT_PDS_ACK_GEN_MIN_PKT_ADD,
+			uet->pds.ack_gen_trigger / 16);
+	rc = uet_env_u32("UET_PDS_ACK_GEN_TRIGGER", 0,
+			 UET_PDS_ACK_GEN_TRIGGER_MAX, &v);
+	if (rc < 0)
+		return rc;
+	if (rc > 0)
+		uet->pds.ack_gen_trigger = v;
+	rc = uet_env_u32("UET_PDS_ACK_GEN_MIN_PKT_ADD", 0,
+			 UET_PDS_ACK_GEN_MIN_PKT_ADD_MAX, &v);
+	if (rc < 0)
+		return rc;
+	if (rc > 0)
+		uet->pds.ack_gen_min_pkt_add = v;
+
+	return 0;
+}
+
+int uet_get_wire_info(uet_handle_t handle, struct uet_wire_info *info)
+{
+	struct uet_instance *uet = (struct uet_instance *) handle;
+
+	if (uet == NULL || info == NULL)
+		return -FI_EINVAL;
+
+	memset(info, 0, sizeof(*info));
+	info->ip_mtu = (uint32_t)UET_NIC(uet)->mtu;
+	info->payload_mtu = (uint32_t)uet->max_payload_len;
+	info->udp = uet->udp_encap;
+	info->udp_port = uet->uet_udp_port;
+	info->ipproto = uet->uet_ipproto;
+	info->ack_gen_trigger = uet->pds.ack_gen_trigger;
+	info->ack_gen_min_pkt_add = uet->pds.ack_gen_min_pkt_add;
+	return FI_SUCCESS;
+}
+
 int uet_initialize(uet_handle_t *handle)
 {
 	int rc;
@@ -6649,10 +6774,15 @@ int uet_initialize(uet_handle_t *handle)
 	if (rc != FI_SUCCESS)
 		goto err_sec;
 
-	uet->max_payload_len = UET_DEFAULT_MAX_PAYLOAD_LEN;
+	rc = uet_wire_config(uet);
+	if (rc != FI_SUCCESS)
+		goto err_wire;
 
 	*handle = uet;
 	return FI_SUCCESS;
+
+err_wire:
+	uet_sec_finalize();
 
 err_sec:
 	imp_shim_finalize();

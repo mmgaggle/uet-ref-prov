@@ -236,6 +236,11 @@ Replace `2` with the desired number of senders.
 - **UET_PDS_ACK_TYPE** - [ `ack` | `ack_cc` | `ack_ccx` ] (default=`ack`)
 - **UET_PDS_TX_TIMEOUT** - Time in milliseconds to wait for an ack before retransmitting a Tx packet (default=`5`).
 - **UET_PDS_MAX_TX_RETRIES** - Max number of times a Tx packet is retransmitted before failing (default=`5`).
+- **UET_ENCAP** - [ `udp` | `ip` ] (default=`udp`) How UET is put on the wire (UEC 1.0.1, 3.2.5): in UDP to port `UET_UDP_PORT`, with the entropy in the UDP source port and a zero checksum, or directly in IP protocol `UET_IPPROTO` behind an entropy header. Packets in either form are accepted.
+- **UET_UDP_PORT** - UDP destination port (default=`4793`, the IANA-assigned port of Table 3-28).
+- **UET_IPPROTO** - IP protocol number when UET runs directly over IP (default=`253`, experimental).
+- **UET_MAX_PAYLOAD** - [ `1024` | `2048` | `4096` | `8192` ] The Payload MTU (3.4.1.11). By default the largest one whose packets fit the interface MTU: `1024` at an MTU of 1500, `8192` at 9000. Every FEP of a fabric must use the same value.
+- **UET_PDS_ACK_GEN_TRIGGER**, **UET_PDS_ACK_GEN_MIN_PKT_ADD** - ACK coalescing in bytes (3.5.12.4.1). By default `16384` and `1024`; with a Payload MTU of 8192, `32768` and `2048`, so an ACK still covers four full packets.
 - **UET_NUM_ITERATIONS** - Override the number of message iterations the test app runs (default=`100`). Used to wall-clock-size a run (e.g., long enough to span several TSS key rotations).
 - **UET_MSG_SIZE** - Override the message size used by the test app (default=`4096`).
 - **UET_FORCE_RUDI** - [ `0` | `1` ] (default=`0`) Force the RUDI (Reliable Unordered Delivery for Idempotent operations) PDS delivery mode for RMA read/write operations. This is the default for new endpoints; `uet_ep_setopt(UET_OPT_FORCE_RUDI)` overrides it per endpoint.

@@ -23,9 +23,24 @@
 
 #define UET_SEC_IV_SIZE 12
 
-#define DEF_AOFF_V4     -12 /* AAD src/dest IPv4 (8) + entropy (4) */
-#define DEF_AOFF_V6     -36 /* AAD src/dest IPv6 (32) + entropy (4) */
-#define UET_SEC_AOFF(is_ipv6) ((is_ipv6) ? DEF_AOFF_V6 : DEF_AOFF_V4)
+/*
+ * The AAD starts at the IP source address: the source and destination
+ * addresses (8 bytes for IPv4, 32 for IPv6), then the entropy header (4)
+ * or the UDP header (8), with its checksum 0 (UEC 1.0.1, 3.7.11.1.3), and
+ * the TSS header. The offset is from the TSS header, so it is negative.
+ */
+#define UET_SEC_AOFF(is_ipv6, encap_len)				\
+	(-(int)(((is_ipv6) ? 32 : 8) + (encap_len)))
+
+/* where the TSS header goes, after the IP and entropy or UDP headers */
+static uint8_t *uet_sec_hdr_ptr(uint8_t *pkt, bool is_ipv6)
+{
+	uint8_t *ip = pkt + sizeof(struct ethhdr);
+
+	return (ip + (is_ipv6 ? sizeof(struct ipv6hdr) :
+				sizeof(struct iphdr)) +
+		uet_ip_encap_len(ip, is_ipv6));
+}
 
 int uet_sec_build_hdr(uint32_t sdi,
 		      uint32_t ssi,
@@ -69,10 +84,7 @@ int uet_sec_build_hdr(uint32_t sdi,
 	tx_an = uet_sec_sd_tx_an(sd);
 	uet_sec_sd_tx_rotate(sd);
 
-	copy_len = (sizeof(struct ethhdr) +
-		    (is_ipv6 ? sizeof(struct ipv6hdr) :
-			       sizeof(struct iphdr)) +
-		    sizeof(struct uet_entropy));
+	copy_len = (int)(uet_sec_hdr_ptr(pkt, is_ipv6) - pkt);
 
 	/* move the Ethernet and IP headers down */
 	if (sd->use_ssi) {
@@ -155,11 +167,7 @@ int uet_sec_update_hdr_tsc(uint8_t *pkt, bool is_ipv6)
 	uint64_t tsc;
 	uint32_t tfs;
 
-	sec = (struct uet_sec *)(pkt +
-				 sizeof(struct ethhdr) +
-				 (is_ipv6 ? sizeof(struct ipv6hdr) :
-					    sizeof(struct iphdr)) +
-				 sizeof(struct uet_entropy));
+	sec = (struct uet_sec *)uet_sec_hdr_ptr(pkt, is_ipv6);
 	sec_ssi = (struct uet_sec_ssi *)sec;
 
 	tfs = ntohl(sec->type_flags_sdi);
@@ -265,11 +273,7 @@ int uet_sec_enc_pkt(struct uet_instance *uet,
 	else
 		ipv4 = (struct iphdr *)(pkt + sizeof(struct ethhdr));
 
-	sec_hdr = (pkt +
-		   sizeof(struct ethhdr) +
-		   (is_ipv6 ? sizeof(struct ipv6hdr) :
-			      sizeof(struct iphdr)) +
-		   sizeof(struct uet_entropy));
+	sec_hdr = uet_sec_hdr_ptr(pkt, is_ipv6);
 	sec = (struct uet_sec *)sec_hdr;
 	sec_ssi = (struct uet_sec_ssi *)sec_hdr;
 
@@ -418,7 +422,10 @@ int uet_sec_enc_pkt(struct uet_instance *uet,
 
 	/* encrypt the packet */
 
-	aad = (sec_hdr + UET_SEC_AOFF(is_ipv6)); /* likely negative, moves back */
+	aad = (sec_hdr + UET_SEC_AOFF(is_ipv6,
+				      uet_ip_encap_len(pkt +
+						       sizeof(struct ethhdr),
+						       is_ipv6)));
 
 	tmp_val = (sd->use_ssi) ? sec_ssi->ssi :
 				  (is_ipv6) ? htonl(sdi) : ipv4->saddr;
@@ -461,6 +468,24 @@ int uet_sec_enc_pkt(struct uet_instance *uet,
 	sd->stats.out_auth_pkts++;
 
 	return 0;
+}
+
+/*
+ * UET over IP or over UDP. With UDP the checksum is ignored on receive and
+ * is 0 in the AAD (UEC 1.0.1, 3.5.10.1 and 3.7.11.1.3), so it is cleared
+ * here, before the ICV is checked.
+ */
+static bool uet_sec_uet_proto(const struct uet_instance *uet, uint8_t proto,
+			      void *l4)
+{
+	struct udphdr *udp = (struct udphdr *)l4;
+
+	if (proto == uet->uet_ipproto)
+		return true;
+	if ((proto != IPPROTO_UDP) || (ntohs(udp->dest) != uet->uet_udp_port))
+		return false;
+	udp->check = 0;
+	return true;
 }
 
 int uet_sec_dec_pkt(struct uet_instance *uet,
@@ -513,7 +538,7 @@ int uet_sec_dec_pkt(struct uet_instance *uet,
 	if (is_ipv6) {
 		ipv6 = (struct ipv6hdr *)(pkt + sizeof(struct ethhdr));
 		if ((eth->h_proto != htons(ETH_P_IPV6)) ||
-		    (ipv6->nexthdr != uet->uet_ipproto)) {
+		    !uet_sec_uet_proto(uet, ipv6->nexthdr, ipv6 + 1)) {
 			*tag_len = 0;
 			return 0;
 		}
@@ -522,17 +547,13 @@ int uet_sec_dec_pkt(struct uet_instance *uet,
 		if ((eth->h_proto != htons(ETH_P_IP)) ||
 		    (ipv4->version != IPVERSION) ||
 		    (ipv4->ihl != UET_IPV4_IHL_NO_OPTIONS) ||
-		    (ipv4->protocol != uet->uet_ipproto)) {
+		    !uet_sec_uet_proto(uet, ipv4->protocol, ipv4 + 1)) {
 			*tag_len = 0;
 			return 0;
 		}
 	}
 
-	sec_hdr = (pkt +
-		   sizeof(struct ethhdr) +
-		   (is_ipv6 ? sizeof(struct ipv6hdr) :
-			      sizeof(struct iphdr)) +
-		   sizeof(struct uet_entropy));
+	sec_hdr = uet_sec_hdr_ptr(pkt, is_ipv6);
 	sec = (struct uet_sec *)sec_hdr;
 	sec_ssi = (struct uet_sec_ssi *)sec_hdr;
 
@@ -707,7 +728,10 @@ int uet_sec_dec_pkt(struct uet_instance *uet,
 
 	/* decrypt the packet */
 
-	aad = (sec_hdr + UET_SEC_AOFF(is_ipv6)); /* likely negative, moves back */
+	aad = (sec_hdr + UET_SEC_AOFF(is_ipv6,
+				      uet_ip_encap_len(pkt +
+						       sizeof(struct ethhdr),
+						       is_ipv6)));
 
 	tmp_val = (sd->use_ssi) ? sec_ssi->ssi :
 				  (is_ipv6) ? htonl(sdi) : ipv4->saddr;

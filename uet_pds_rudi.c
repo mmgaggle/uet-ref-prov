@@ -218,7 +218,7 @@ static int uet_rudi_build_frame(struct uet_instance *uet,
 				void *payload, size_t payload_len,
 				struct uet_rudi_out_pkt *rp)
 {
-	struct uet_entropy *entropy_hdr;
+	void *entropy_hdr;
 	struct uet_pds_rudi_req *rudi_hdr;
 	void *ses_hdr, *pl;
 	size_t ip_hdr_size;
@@ -250,25 +250,24 @@ static int uet_rudi_build_frame(struct uet_instance *uet,
 	uet_build_eth_hdr((struct ethhdr *)rp->pkt, (uint8_t *)dst_mac,
 			  uet->nic.mac_addr, is_ipv6);
 
-	entropy_hdr = (struct uet_entropy *)(rp->pkt + sizeof(struct ethhdr) +
-					     ip_hdr_size);
+	entropy_hdr = (void *)(rp->pkt + sizeof(struct ethhdr) +
+			       ip_hdr_size);
 	rudi_hdr = (struct uet_pds_rudi_req *)(rp->pkt + sizeof(struct ethhdr) +
 					       ip_hdr_size +
-					       sizeof(struct uet_entropy));
+					       uet_encap_len(uet));
 	ses_hdr = (rudi_hdr + 1);
 	pl = ((uint8_t *)ses_hdr + ses_len);
 
 	hdr_len = (sizeof(struct ethhdr) +
 		   ip_hdr_size +
-		   sizeof(struct uet_entropy) +
+		   uet_encap_len(uet) +
 		   sizeof(struct uet_pds_rudi_req) +
 		   ses_len);
 
 	rp->pkt_len = (hdr_len + payload_len);
 
 	/* fill in the entropy */
-	entropy_hdr->entropy = htons(entropy);
-	entropy_hdr->rsvd = 0;
+	uet_build_encap_hdr(uet, entropy_hdr, entropy);
 
 	/* fill in the RUDI header */
 	tnf = ((pds_type << UET_PDS_TYPE_SHIFT) |

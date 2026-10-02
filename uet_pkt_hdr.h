@@ -8,11 +8,17 @@
 #ifndef _UET_PKT_HDR_H_
 #define _UET_PKT_HDR_H_
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <netinet/if_ether.h>
+#include <netinet/in.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
+#include <linux/udp.h>
 #include <arpa/inet.h>
+
+#include "uet_payload.h"
 
 #define UET_MAX_VLAN_TAGS	2
 
@@ -37,10 +43,17 @@
 #define UET_IPPROTO_EXT_HDR_DEST_OPTS	60
 #define UET_IPPROTO_EXT_HDR_MOBILITY	135
 
-#define UET_UDP_PORT	49150 /* for UET over UDP encap */
+/*
+ * UDP destination port for UET over UDP: UEC 1.0.1, 3.2.5 (UET runs over
+ * IP/UDP, or experimentally over IP directly) and Table 3-28
+ * (UDP_Dest_Port, default 4793, the IANA-assigned port; 3.5.10.1, 3.7.11).
+ * The entropy value goes in the UDP source port, and the checksum is sent
+ * as 0 and ignored on receive (3.5.10.1).
+ */
+#define UET_UDP_PORT	4793
 
-#define UET_DEFAULT_MAX_PAYLOAD_LEN	1024
-#define UET_MAX_PAYLOAD_LEN		8192 /* upper bound */
+#define UET_DEFAULT_MAX_PAYLOAD_LEN	UET_PAYLOAD_MTU_MIN
+#define UET_MAX_PAYLOAD_LEN		UET_PAYLOAD_MTU_MAX /* upper bound */
 
 #define UET_PACKED __attribute__((__packed__))
 
@@ -78,6 +91,21 @@ struct UET_PACKED uet_entropy {
 	uint16_t entropy;
 	uint16_t rsvd;
 };
+
+/*
+ * The header between the IP header and the PDS (or TSS) header: UDP when
+ * the IP header says UDP, else the entropy header. ip points at an IPv4
+ * header without options, or an IPv6 header without extension headers,
+ * which is what UET packets have.
+ */
+static inline size_t uet_ip_encap_len(const void *ip, bool is_ipv6)
+{
+	unsigned int proto = is_ipv6 ? ((const struct ipv6hdr *)ip)->nexthdr
+				     : ((const struct iphdr *)ip)->protocol;
+
+	return (proto == IPPROTO_UDP) ? sizeof(struct udphdr)
+				      : sizeof(struct uet_entropy);
+}
 
 /****************************************************************************/
 /*                              SECURITY                                    */
