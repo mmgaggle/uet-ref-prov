@@ -8,6 +8,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <linux/if_ether.h>
 
 #include "uet_pkt_hdr.h"
@@ -40,6 +41,11 @@ struct uet_pds_sng_tx_state {
 		uint8_t ses_hdr[UET_MAX_SES_HDR_BYTES];
 		size_t ses_hdr_len;
 	} pkt_parms;
+	/* The payload, for a retransmission. The caller's buffer cannot be
+	 * kept: the SES frees the one it gathers a payload into as soon as
+	 * the packet is handed over. */
+	uint8_t *pkt_copy;
+	size_t pkt_copy_size;
 };
 
 /* pds state structure                                                 */
@@ -628,6 +634,9 @@ void uet_pds_sng_ep_finalize(struct uet_ep *uet_ep)
 	struct uet_pds_sng_state *pds_state =
 		(struct uet_pds_sng_state *)uet_ep->pds;
 
+	free(pds_state->tx.pkt_copy);
+	pds_state->tx.pkt_copy = NULL;
+
 	head = &pds_state->ack_state_list_head;
 	dlist_foreach(head, item) {
 		pds_rx = container_of(item, struct uet_pds_ack_state,
@@ -790,6 +799,21 @@ int uet_pds_sng_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
 		state->pkt_parms.pds_info_valid = false;
 	state->pkt_parms.msg_id = msg_id;
 	state->pkt_parms.next_hdr = next_hdr;
+	if (!(flags & UET_PDS_FLAG_RETRANSMIT) && (pkt_len != 0) &&
+	    (pkt != state->pkt_copy)) {
+		if (pkt_len > state->pkt_copy_size) {
+			uint8_t *copy = realloc(state->pkt_copy, pkt_len);
+
+			if (copy == NULL) {
+				free(uet_pkt);
+				return -ENOMEM;
+			}
+			state->pkt_copy = copy;
+			state->pkt_copy_size = pkt_len;
+		}
+		memcpy(state->pkt_copy, pkt, pkt_len);
+		pkt = state->pkt_copy;
+	}
 	state->pkt_parms.pkt = pkt;
 	state->pkt_parms.pkt_len = pkt_len;
 	state->pkt_parms.dma_rdy = dma_rdy;
