@@ -24,9 +24,11 @@ const struct uetfi_core_desc uetfi_core_desc = {
 	/*
 	 * The core has no flow control for RUDI and sends a message's
 	 * packets at once; a burst larger than the receiver's socket
-	 * buffer is lost and recovered only by timeouts.
+	 * buffer is lost and recovered only by timeouts. So a segment is
+	 * 16 packets (16 KiB at an MTU of 1500, 128 KiB with jumbo frames)
+	 * and two are in flight.
 	 */
-	.segment_size = 16384,
+	.segment_pkts = 16,
 	.max_segments = 2,
 };
 

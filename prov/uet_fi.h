@@ -32,6 +32,7 @@
 #include <rdma/providers/fi_prov.h>
 
 #include "uet_core.h"
+#include "../uet_payload.h"
 
 #define UETFI_PROV_NAME		"uet"
 #define UETFI_FABRIC_NAME	"uet"
@@ -92,9 +93,11 @@ struct uetfi_params {
 	int rudi;		/* FI_UET_RUDI */
 	int tx_timeout_ms;	/* FI_UET_TX_TIMEOUT, <0 => unset */
 	int progress_burst;	/* FI_UET_PROGRESS_BURST */
-	size_t segment_size;	/* FI_UET_SEGMENT_SIZE */
+	size_t segment_size;	/* FI_UET_SEGMENT_SIZE, 0 => the core's */
 	int max_segments;	/* FI_UET_MAX_SEGMENTS */
 	int tx_retries;		/* FI_UET_TX_RETRIES, <0 => unset */
+	char *encap;		/* FI_UET_ENCAP, NULL => $UET_ENCAP */
+	size_t max_payload;	/* FI_UET_MAX_PAYLOAD, 0 => from the MTU */
 };
 extern struct uetfi_params uetfi_params;
 
@@ -264,10 +267,17 @@ struct uetfi_core_desc {
 	const char *if_usable;		/* what makes an interface usable */
 	const char *init_hint;		/* why uet_initialize can fail */
 	size_t cq_data_size;		/* immediate data; 0 if the core has none */
-	size_t segment_size;		/* default FI_UET_SEGMENT_SIZE */
+	/*
+	 * Default FI_UET_SEGMENT_SIZE: segment_pkts full packets of the
+	 * Payload MTU, or segment_size bytes when segment_pkts is 0.
+	 */
+	unsigned int segment_pkts;
+	size_t segment_size;
 	int max_segments;		/* default FI_UET_MAX_SEGMENTS */
 };
 extern const struct uetfi_core_desc uetfi_core_desc;
+unsigned int uetfi_payload_mtu(const struct uetfi_ifinfo *ifinfo);
+size_t uetfi_segment_size(const struct uetfi_ifinfo *ifinfo);
 int uetfi_if_query(const char *name, struct uetfi_ifinfo *ifinfo);
 int uetfi_if_foreach(int (*fn)(const struct uetfi_ifinfo *, void *),
 		     void *arg);

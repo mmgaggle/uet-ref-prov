@@ -8,7 +8,10 @@
 #   prov/run_tests.sh setup | run | teardown | all
 #
 # UETFI_TEST_ENV adds environment to every test process, for example
-# UETFI_TEST_ENV="FI_UET_RUDI=0" to run everything over RUD.
+# UETFI_TEST_ENV="FI_UET_RUDI=0" to run everything over RUD, or
+# UETFI_TEST_ENV="FI_UET_ENCAP=ip" to put UET directly in IP. UETFI_TEST_MTU
+# sets the MTU of the veths and the bridge (default 1500; 9000 gives a
+# Payload MTU of 8192).
 #
 set -u
 DIR=$(cd "$(dirname "$0")" && pwd)
@@ -17,18 +20,21 @@ GID_=$(id -g)
 TMP=$(mktemp -d /tmp/uet-fi-test.XXXXXX)
 trap 'rm -rf "$TMP"' EXIT
 
+MTU=${UETFI_TEST_MTU:-1500}
+
 setup() {
 	local i=1 ns
 	sudo ip netns add ofi-br
 	sudo ip netns exec ofi-br ip link add br0 type bridge
-	sudo ip netns exec ofi-br ip link set br0 up
+	sudo ip netns exec ofi-br ip link set br0 mtu "$MTU" up
 	for ns in ofi-a ofi-b ofi-c; do
 		sudo ip netns add $ns
 		sudo ip link add ofi0 netns $ns type veth peer name $ns-br \
 			netns ofi-br
-		sudo ip netns exec ofi-br ip link set $ns-br master br0 up
+		sudo ip netns exec ofi-br ip link set $ns-br mtu "$MTU" \
+			master br0 up
 		sudo ip netns exec $ns ip addr add 10.89.0.$i/24 dev ofi0
-		sudo ip netns exec $ns ip link set ofi0 up
+		sudo ip netns exec $ns ip link set ofi0 mtu "$MTU" up
 		sudo ip netns exec $ns ip link set lo up
 		i=$((i + 1))
 	done

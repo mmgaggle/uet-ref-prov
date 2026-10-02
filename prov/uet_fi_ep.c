@@ -662,7 +662,7 @@ int uetfi_endpoint(struct fid_domain *domain, struct fi_info *info,
 	ep->tx_op_flags = info->tx_attr ?
 			  (info->tx_attr->op_flags & UETFI_TX_OP_FLAGS) : 0;
 
-	ep->seg_size = uetfi_params.segment_size;
+	ep->seg_size = uetfi_segment_size(&dom->ifinfo);
 	ep->max_segs = uetfi_params.max_segments;
 
 	ep->core_info = fi_dupinfo(dom->core_info);

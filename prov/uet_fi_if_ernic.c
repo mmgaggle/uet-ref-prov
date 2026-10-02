@@ -32,6 +32,7 @@ const struct uetfi_core_desc uetfi_core_desc = {
 	 * Every segment is a command to the device and a reply back, and
 	 * the engine paces the wire itself, so segments can be large.
 	 */
+	.segment_pkts = 0,
 	.segment_size = 1 << 20,
 	.max_segments = 4,
 };

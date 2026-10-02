@@ -150,9 +150,15 @@ atomic and collective operations return `-FI_ENOSYS`.
 * The core has no flow control for RUDI. It sends all packets of a
   message at once, so a burst larger than the receiver's socket buffer
   is lost and recovered only by 200 ms timeouts. The provider therefore
-  sends a write as segments of 16 KiB with at most 2 in flight per
-  endpoint. Writes of any size are accepted; up to `tx_attr->size`
-  writes can be outstanding.
+  sends a write as segments of 16 packets (16 KiB at an MTU of 1500,
+  128 KiB at 9000) with at most 2 in flight per endpoint. Writes of any
+  size are accepted; up to `tx_attr->size` writes can be outstanding.
+* The core carries UET in UDP to port 4793 by default (`FI_UET_ENCAP=ip`
+  puts it directly in IP protocol 253, behind an entropy header), and
+  takes packets in either form. Its Payload MTU is the largest of 1024,
+  2048, 4096 and 8192 bytes that fits the netdev's MTU, unless
+  `FI_UET_MAX_PAYLOAD` sets it. Every peer must use the same Payload
+  MTU, so give peers' interfaces the same MTU.
 * `fi_close()` on an endpoint discards the writes it still has
   outstanding, as fi_endpoint(3) requires: no completion is reported for
   them, and none of their packets is sent or retransmitted once the
@@ -178,9 +184,11 @@ atomic and collective operations return `-FI_ENOSYS`.
 | `FI_UET_RUDI` | 1 | mark remotely writable regions `IDEMPOTENT_SAFE` and set `UET_FORCE_RUDI` |
 | `FI_UET_TX_TIMEOUT` | `$UET_PDS_TX_TIMEOUT`, else 200 | retransmit timeout in ms |
 | `FI_UET_TX_RETRIES` | `$UET_PDS_MAX_TX_RETRIES`, else 25 | retransmissions before a write fails |
-| `FI_UET_SEGMENT_SIZE` | 16384 (1048576 for CORE=ernic) | bytes per write segment |
+| `FI_UET_SEGMENT_SIZE` | 16 packets of the Payload MTU (1048576 for CORE=ernic) | bytes per write segment |
 | `FI_UET_MAX_SEGMENTS` | 2 (4 for CORE=ernic) | segments in flight per endpoint |
 | `FI_UET_PROGRESS_BURST` | 64 | core progress calls per CQ read; each handles at most one received packet |
+| `FI_UET_ENCAP` | `$UET_ENCAP`, else `udp` | `udp` (UDP port 4793) or `ip` (IP protocol 253); exported as `UET_ENCAP`. CORE=ernic: the engine's `encap=` decides |
+| `FI_UET_MAX_PAYLOAD` | `$UET_MAX_PAYLOAD`, else from the MTU | Payload MTU, 1024, 2048, 4096 or 8192; exported as `UET_MAX_PAYLOAD`. CORE=ernic: the engine's `mtu=` decides |
 
 When a domain is first opened, the provider sets `UET_PDS=pds` unless
 it is already set. The core reads the `UET_*` variables, so they can

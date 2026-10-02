@@ -23,7 +23,43 @@ struct uetfi_params uetfi_params = {
 	.segment_size = 0,	/* the core's default */
 	.max_segments = 0,
 	.tx_retries = -1,
+	.encap = NULL,
+	.max_payload = 0,
 };
+
+/*
+ * The Payload MTU the core will use on a domain: FI_UET_MAX_PAYLOAD (or
+ * $UET_MAX_PAYLOAD) when set, else the largest that fits the domain's MTU,
+ * which is what the reference core picks. An ernic engine picks its own
+ * from its wire's MTU; segments over it are sized in bytes, not packets.
+ */
+unsigned int uetfi_payload_mtu(const struct uetfi_ifinfo *ifinfo)
+{
+	const char *env = getenv("UET_MAX_PAYLOAD");
+	unsigned long v;
+
+	if (uet_payload_mtu_valid((unsigned int)uetfi_params.max_payload))
+		return (unsigned int)uetfi_params.max_payload;
+	if (env) {
+		v = strtoul(env, NULL, 0);
+		if (v <= UET_PAYLOAD_MTU_MAX &&
+		    uet_payload_mtu_valid((unsigned int)v))
+			return (unsigned int)v;
+	}
+	return uet_payload_mtu_for_ip_mtu(ifinfo && ifinfo->mtu ?
+					  ifinfo->mtu : 1500);
+}
+
+/* bytes per write segment on a domain */
+size_t uetfi_segment_size(const struct uetfi_ifinfo *ifinfo)
+{
+	if (uetfi_params.segment_size)
+		return uetfi_params.segment_size;
+	if (uetfi_core_desc.segment_pkts)
+		return (size_t)uetfi_core_desc.segment_pkts *
+		       uetfi_payload_mtu(ifinfo);
+	return uetfi_core_desc.segment_size;
+}
 
 ssize_t uetfi_nosys(void)
 {
@@ -204,6 +240,12 @@ static void uetfi_core_env(void)
 		setenv("UET_PDS_MAX_TX_RETRIES", val, 1);
 	} else {
 		setenv("UET_PDS_MAX_TX_RETRIES", "25", 0);
+	}
+	if (uetfi_params.encap && *uetfi_params.encap)
+		setenv("UET_ENCAP", uetfi_params.encap, 1);
+	if (uetfi_params.max_payload) {
+		snprintf(val, sizeof(val), "%zu", uetfi_params.max_payload);
+		setenv("UET_MAX_PAYLOAD", val, 1);
 	}
 }
 
@@ -781,19 +823,33 @@ struct fi_provider *fi_prov_ini(void)
 
 	fi_param_define(&uetfi_prov, "segment_size", FI_PARAM_SIZE_T,
 			"Writes are sent in segments of this many bytes "
-			"(default: 16384, 1048576 over an ernic engine)");
+			"(default: 16 packets of the Payload MTU, so 16384 at "
+			"an MTU of 1500 and 131072 at 9000; 1048576 over an "
+			"ernic engine)");
 	fi_param_define(&uetfi_prov, "max_segments", FI_PARAM_INT,
 			"Write segments in flight per endpoint. The reference "
 			"provider has no flow control for RUDI, so this bounds "
 			"the burst a target has to absorb (default: 2, 4 over "
 			"an ernic engine)");
+	fi_param_define(&uetfi_prov, "encap", FI_PARAM_STRING,
+			"udp to carry UET in UDP to port 4793 (UEC 1.0.1 "
+			"3.2.5), ip to carry it directly in IP protocol 253; "
+			"exported as UET_ENCAP. Packets in either form are "
+			"accepted. An ernic engine has its own setting "
+			"(default: $UET_ENCAP, else udp)");
+	fi_param_define(&uetfi_prov, "max_payload", FI_PARAM_SIZE_T,
+			"Payload MTU: 1024, 2048, 4096 or 8192, the same on "
+			"every peer; exported as UET_MAX_PAYLOAD. An ernic "
+			"engine has its own (default: $UET_MAX_PAYLOAD, else "
+			"the largest that fits the netdev's MTU: 1024 at "
+			"1500, 8192 at 9000)");
 	fi_param_define(&uetfi_prov, "tx_retries", FI_PARAM_INT,
 			"PDS retransmissions before a write fails, exported "
 			"as UET_PDS_MAX_TX_RETRIES. A target must make progress "
 			"at least once per tx_timeout * tx_retries (default: "
 			"$UET_PDS_MAX_TX_RETRIES, else 25)");
 
-	uetfi_params.segment_size = uetfi_core_desc.segment_size;
+	uetfi_params.segment_size = 0;	/* uetfi_segment_size() */
 	uetfi_params.max_segments = uetfi_core_desc.max_segments;
 	fi_param_get_str(&uetfi_prov, "ifname", &uetfi_params.ifname);
 	fi_param_get_bool(&uetfi_prov, "rudi", &uetfi_params.rudi);
@@ -806,9 +862,26 @@ struct fi_provider *fi_prov_ini(void)
 	fi_param_get_int(&uetfi_prov, "max_segments",
 			 &uetfi_params.max_segments);
 	fi_param_get_int(&uetfi_prov, "tx_retries", &uetfi_params.tx_retries);
+	fi_param_get_str(&uetfi_prov, "encap", &uetfi_params.encap);
+	fi_param_get_size_t(&uetfi_prov, "max_payload",
+			    &uetfi_params.max_payload);
+	if (uetfi_params.max_payload &&
+	    !uet_payload_mtu_valid((unsigned int)uetfi_params.max_payload)) {
+		UETFI_WARN(FI_LOG_CORE, "FI_UET_MAX_PAYLOAD must be 1024, "
+			   "2048, 4096 or 8192; ignoring %zu\n",
+			   uetfi_params.max_payload);
+		uetfi_params.max_payload = 0;
+	}
+	if (uetfi_params.encap && *uetfi_params.encap &&
+	    strcmp(uetfi_params.encap, "udp") &&
+	    strcmp(uetfi_params.encap, "ip")) {
+		UETFI_WARN(FI_LOG_CORE, "FI_UET_ENCAP must be udp or ip; "
+			   "ignoring %s\n", uetfi_params.encap);
+		uetfi_params.encap = NULL;
+	}
 	if (uetfi_params.progress_burst < 1)
 		uetfi_params.progress_burst = 1;
-	if (uetfi_params.segment_size < 1024)
+	if (uetfi_params.segment_size && uetfi_params.segment_size < 1024)
 		uetfi_params.segment_size = 1024;
 	if (uetfi_params.max_segments < 1)
 		uetfi_params.max_segments = 1;

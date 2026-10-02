@@ -69,7 +69,7 @@ endif
 GLUE_SRC := uet_fi_init.c uet_fi_domain.c uet_fi_ep.c uet_fi_cq.c \
 	    uet_fi_if_$(CORE_IF).c
 GLUE_OBJ := $(GLUE_SRC:%.c=obj/%.o)
-GLUE_HDRS := uet_fi.h uet_core.h $(TOP)/uet_addr.h
+GLUE_HDRS := uet_fi.h uet_core.h $(TOP)/uet_addr.h $(TOP)/uet_payload.h
 GLUE_CFLAGS := $(OPT) -fPIC -fvisibility=hidden -Wall -Wextra
 
 all: $(LIB) $(TEST) $(CORE_CHECKS)
