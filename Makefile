@@ -46,14 +46,26 @@ LF_LIBS=-L$(LIBFABRIC)/src/.libs -lfabric
 LF_LOCAL_HDRS=-I./libfabric_headers -I./libfabric_headers/include
 
 INCS=-I. -I./util -I./imp_shim -I./nic_shim -I./crypto
-CFLAGS=-Wall \
+
+# Optimization and debug info. Everything used to build without -O, which
+# left the datapath (header parsing, PDS bookkeeping, payload copies) at
+# -O0. "make OPT=-O0" brings that back. Objects are rebuilt when OPT
+# changes, through the stamp below.
+OPT ?= -O2 -g
+OPT_STAMP := .build-opt
+$(shell echo '$(OPT)' | cmp -s - $(OPT_STAMP) 2>/dev/null || \
+	echo '$(OPT)' > $(OPT_STAMP))
+
+CFLAGS=$(OPT) \
+       -Wall \
        -Wno-unused-variable \
        -Wno-implicit-function-declaration \
        -Wno-int-conversion \
        -Wno-address-of-packed-member
 LDFLAGS=-lpthread
 
-HDRS=$(wildcard *.h util/*.h imp_shim/*.h nic_shim/*.h crypto/*.h)
+HDRS=$(wildcard *.h util/*.h imp_shim/*.h nic_shim/*.h crypto/*.h) \
+     $(OPT_STAMP)
 
 # Shared library sources (common for both variants)
 LIB_SRC=$(filter-out uet.c, \
@@ -240,6 +252,6 @@ clean:
 		$(XDP_LIB_OBJ_DIR) $(XDP_LIB) \
 		$(XDP_OBJ_DIR) $(XDP_BIN) \
 		$(XDP_KERN_BIN) \
-		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN)
+		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN) $(OPT_STAMP)
 
 .PHONY: all xdp strict-core cc_sim clean prov prov-clean
