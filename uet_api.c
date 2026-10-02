@@ -1237,6 +1237,20 @@ static void uet_tx_desc_ring_rotate(struct uet_tx_desc *tail_tx_desc)
 /* insert entry into list of available rx descriptors for an endpoint */
 static void uet_rx_desc_list_insert(struct uet_rx_desc *rx_desc)
 {
+	/* release a vector or segment list this descriptor copied for itself
+	 * before the flags that record its ownership are cleared
+	 */
+	if (rx_desc->desc_flags & UET_RX_DESC_FLAG_OWNS_IOV) {
+		free((struct iovec *)rx_desc->buf_desc.iov.iov);
+		rx_desc->buf_desc.iov.iov = NULL;
+	}
+
+	if (rx_desc->desc_flags & UET_RX_DESC_FLAG_OWNS_SEG) {
+		free(rx_desc->buf_desc.seg.seg);
+		rx_desc->buf_desc.seg.seg = NULL;
+		rx_desc->buf_desc.seg.seg_count = 0;
+	}
+
 	rx_desc->desc_flags = UET_RX_DESC_FLAG_NONE;
 	dlist_insert_head(&rx_desc->list_entry,
 			  &rx_desc->uet_ep->rx_desc_list_head);
@@ -3272,16 +3286,45 @@ static size_t gather_iov_to_flat(
 /*
  * Translate a dma address to something this process can dereference.
  *
- * FIXME: For future use with a device model does not own the memory its page
- * lists describe and only the device model can resolve them...
+ * When the instance runs in the address space that owns the memory, a dma
+ * address is a process address. A device model does not own the memory its
+ * page lists describe, so it installs a translator (uet_set_dma_translate())
+ * and only it can resolve them. write says whether the caller will store
+ * through the pointer, so that a translator can check permissions and track
+ * dirty pages.
+ *
+ * Callers never ask for a range that crosses a page of the region being
+ * resolved, so a translator only ever has to map memory that is contiguous
+ * in its own address space.
  */
 static void *uet_dma_to_host(const struct uet_instance *uet,
-			     uet_dma_addr_t addr, size_t len)
+			     uet_dma_addr_t addr, size_t len, bool write)
 {
-	(void)uet;
-	(void)len;
+	if (uet->dma_translate != NULL)
+		return uet->dma_translate(uet->dma_translate_ctx, addr, len,
+					  write);
 
 	return (void *)(uintptr_t)addr;
+}
+
+/*
+ * read one entry of a page list directory
+ *
+ * returns false if the entry cannot be translated
+ */
+static bool uet_pbl_dir_entry(const struct uet_instance *uet,
+			      uet_dma_addr_t dir, size_t idx,
+			      uet_dma_addr_t *entry)
+{
+	const uet_dma_addr_t *p;
+
+	p = uet_dma_to_host(uet, (dir + (idx * sizeof(uet_dma_addr_t))),
+			    sizeof(uet_dma_addr_t), false);
+	if (p == NULL)
+		return false;
+
+	memcpy(entry, p, sizeof(*entry));
+	return true;
 }
 
 /*
@@ -3295,18 +3338,19 @@ static void *uet_dma_to_host(const struct uet_instance *uet,
  *   offset  - byte offset into the region's flattened address space
  *   run_len - set to the number of bytes contiguously accessible from the
  *             returned address, never crossing a page boundary
+ *   write   - true when the caller will store through the result
  *
  * returns:
  *   a dereferenceable pointer, or NULL if the offset cannot be resolved
  */
 static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
-				size_t offset, size_t *run_len)
+				size_t offset, size_t *run_len, bool write)
 {
 	const struct uet_mr_desc_pbl *pbl = &mr_desc->buf_desc.pbl;
 	const struct uet_instance *uet = mr_desc->uet_dom->uet;
 	size_t abs, page_idx, page_off, per_dir, dir_idx, ent_idx;
 	uet_dma_addr_t page_addr;
-	uet_dma_addr_t *dir;
+	uet_dma_addr_t dir;
 
 	abs = ((size_t)pbl->page_offset + offset);
 	page_idx = (abs >> pbl->page_shift);
@@ -3315,15 +3359,21 @@ static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
 	switch (pbl->level) {
 	case UET_PBL_LEVEL_0:
 		*run_len = (mr_desc->buf_desc.len - offset);
-		return uet_dma_to_host(uet, (pbl->root + abs), *run_len);
+
+		/*
+		 * The pages are contiguous on the bus but a translator maps
+		 * a page at a time, so do not hand it more than one.
+		 */
+		if ((uet->dma_translate != NULL) &&
+		    (*run_len > ((size_t)pbl->page_size - page_off)))
+			*run_len = ((size_t)pbl->page_size - page_off);
+
+		return uet_dma_to_host(uet, (pbl->root + abs), *run_len,
+				       write);
 
 	case UET_PBL_LEVEL_1:
-		dir = uet_dma_to_host(uet, pbl->root,
-				      ((page_idx + 1) * sizeof(*dir)));
-		if (dir == NULL)
+		if (!uet_pbl_dir_entry(uet, pbl->root, page_idx, &page_addr))
 			return NULL;
-
-		page_addr = dir[page_idx];
 		break;
 
 	case UET_PBL_LEVEL_2:
@@ -3331,16 +3381,11 @@ static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
 		dir_idx = (page_idx / per_dir);
 		ent_idx = (page_idx % per_dir);
 
-		dir = uet_dma_to_host(uet, pbl->root,
-				      ((dir_idx + 1) * sizeof(*dir)));
-		if (dir == NULL)
+		if (!uet_pbl_dir_entry(uet, pbl->root, dir_idx, &dir))
 			return NULL;
 
-		dir = uet_dma_to_host(uet, dir[dir_idx], pbl->page_size);
-		if (dir == NULL)
+		if (!uet_pbl_dir_entry(uet, dir, ent_idx, &page_addr))
 			return NULL;
-
-		page_addr = dir[ent_idx];
 		break;
 
 	default:
@@ -3348,7 +3393,7 @@ static void *uet_mr_pbl_resolve(const struct uet_mr_desc *mr_desc,
 	}
 
 	*run_len = ((size_t)pbl->page_size - page_off);
-	return uet_dma_to_host(uet, (page_addr + page_off), *run_len);
+	return uet_dma_to_host(uet, (page_addr + page_off), *run_len, write);
 }
 
 /*
@@ -3364,7 +3409,7 @@ static size_t uet_mr_pbl_copy(const struct uet_mr_desc *mr_desc, size_t offset,
 	size_t done = 0;
 
 	while (done < len) {
-		p = uet_mr_pbl_resolve(mr_desc, (offset + done), &run);
+		p = uet_mr_pbl_resolve(mr_desc, (offset + done), &run, into_mr);
 		if (p == NULL)
 			break;
 
@@ -3608,7 +3653,8 @@ static void *uet_mr_atomic_addr(const struct uet_mr_desc *mr_desc,
 	}
 
 	case UET_MR_BUF_TYPE_PBL:
-		p = uet_mr_pbl_resolve(mr_desc, offset, &run);
+		/* an atomic reads and writes its operand */
+		p = uet_mr_pbl_resolve(mr_desc, offset, &run, true);
 		break;
 
 	default:
@@ -5412,6 +5458,25 @@ static void *gather_iov_to_buffer(
 	return pkt_buf;
 }
 
+/*
+ * Fail a message that could not be sent in full.
+ *
+ * Once a packet of the message is on the wire, the PDS has mapped the
+ * message id to a PDC and made it that PDC's active message, and only the
+ * end of the message, or a completion indication, clears that. So a
+ * message failed part way has to go through ERR, which waits for the packets
+ * already sent and then gives the PDS its completion indication. Completing
+ * it at once left the PDC with an active message that never ended, and
+ * every later message to the same peer waited behind it forever.
+ */
+static void uet_tx_msg_fail(struct uet_tx_desc *tx_desc, int err_code)
+{
+	uet_tx_desc_set_err(tx_desc, err_code,
+			    tx_desc->transmitted ?
+				UET_TX_DESC_STATE_ERR :
+				UET_TX_DESC_STATE_ERR_COMPLETE);
+}
+
 /* uet message transmission */
 static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 {
@@ -5502,8 +5567,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			if (!pkt_buf) {
 				UET_API_ERR("TX: Failed to gather segments");
 				rc = -FI_ENOMEM;
-				uet_tx_desc_set_err(tx_desc, -rc,
-					UET_TX_DESC_STATE_ERR_COMPLETE);
+				uet_tx_msg_fail(tx_desc, -rc);
 				goto exit;
 			}
 		} else if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) {
@@ -5517,8 +5581,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 				UET_API_ERR("TX: Msg Buffer is null");
 				UET_API_ERR("TX: Failed to gather iov");
 				rc = -FI_ENOMEM;
-				uet_tx_desc_set_err(tx_desc, -rc,
-					UET_TX_DESC_STATE_ERR_COMPLETE);
+				uet_tx_msg_fail(tx_desc, -rc);
 				goto exit;
 			}
 
@@ -5555,8 +5618,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			flags &= ~UET_PDS_FLAG_SOM;
 		} else {
 			if (rc != -FI_EAGAIN)
-				uet_tx_desc_set_err(tx_desc, -rc,
-					UET_TX_DESC_STATE_ERR_COMPLETE);
+				uet_tx_msg_fail(tx_desc, -rc);
 			break;
 		}
 	}
@@ -6036,8 +6098,9 @@ static ssize_t uet_send_req_api_common(
 
 	/* check next-hop mac address */
 	if (!(av_entry->flags & UET_NH_MAC_ADDR_V)) {
-		rc = uet_nic_get_ipv4_nh(UET_NIC(uet), av_entry->addr->fa.v4,
-					 av_entry->nh_mac_addr);
+		rc = uet_nic_get_nh(UET_NIC(uet), &av_entry->addr->fa,
+				    uet_addr_is_ipv6(av_entry->addr),
+				    av_entry->nh_mac_addr);
 		if (rc != FI_SUCCESS)
 			return rc;
 		av_entry->flags |= UET_NH_MAC_ADDR_V;
@@ -6241,10 +6304,10 @@ static ssize_t uet_send_req_api_common(
 	tx_desc->backoff_max = UET_INITIAL_BACKOFF_MAX;
 	tx_desc->pds_mode = uet_get_pds_mode(uet_ep, rma_op);
 
-	/* force RUDI when UET_FORCE_RUDI is set only for WRITE/READ */
+	/* force RUDI when the endpoint asks for it, only for WRITE/READ */
 	if ((((send_req_api == UET_WRITE_API) && (imm_data == NULL)) ||
 	     (send_req_api == UET_READ_API)) &&
-	    getenv("UET_FORCE_RUDI") &&
+	    uet_ep->force_rudi &&
 	    (remote_key & UET_MR_KEY_IDEMPOTENT_SAFE) &&
 	    (av_entry->addr->fep_cap & UET_FEP_CAP_HPC))
 		tx_desc->pds_mode = UET_PDS_MODE_RUDI;
@@ -6604,6 +6667,20 @@ err_return:
 	if (uet != NULL)
 		free(uet);
 	return rc;
+}
+
+int uet_set_dma_translate(uet_handle_t handle, uet_dma_translate_t translate,
+			  void *ctx)
+{
+	struct uet_instance *uet = (struct uet_instance *) handle;
+
+	if (uet == NULL)
+		return -FI_EINVAL;
+
+	uet->dma_translate = translate;
+	uet->dma_translate_ctx = (translate != NULL) ? ctx : NULL;
+
+	return FI_SUCCESS;
 }
 
 int uet_finalize(uet_handle_t handle)
@@ -7036,6 +7113,9 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 	}
 #endif
 	memcpy(&uet_ep->ip_addr, &uet_ep->uet_addr.fa, sizeof(struct uet_fa));
+
+	/* the environment sets the default, uet_ep_setopt() can change it */
+	uet_ep->force_rudi = (getenv("UET_FORCE_RUDI") != NULL);
 
 	uet_ep->num_rx_desc = info->rx_attr->size;
 	uet_ep->rx_desc = calloc(uet_ep->num_rx_desc,
@@ -8916,7 +8996,24 @@ int uet_ep_control(uet_ep_handle_t ep_handle, int command, void *arg)
 int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 		  const void *optval, size_t optlen)
 {
-	return -FI_ENOSYS;
+	struct uet_ep *uet_ep = (struct uet_ep *) ep_handle;
+
+	if ((uet_ep == NULL) || (level != FI_OPT_ENDPOINT))
+		return -FI_ENOSYS;
+
+	switch (optname) {
+	case UET_OPT_FORCE_RUDI:
+		if ((optval == NULL) || (optlen != sizeof(bool)))
+			return -FI_EINVAL;
+
+		pthread_mutex_lock(&uet_ep->data_lock);
+		uet_ep->force_rudi = *(const bool *)optval;
+		pthread_mutex_unlock(&uet_ep->data_lock);
+		return FI_SUCCESS;
+
+	default:
+		return -FI_ENOSYS;
+	}
 }
 
 int uet_cntr_read(uet_cntr_handle_t cntr_handle, uint64_t *value)

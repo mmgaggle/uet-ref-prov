@@ -67,9 +67,11 @@ The `pds` backend (`UET_PDS=pds`) supports all four UET PDS delivery modes:
 - **RUDI** - Reliable Unordered Delivery for Idempotent operations. A
   connectionless mode: no PDC, non-sequential per-packet ids, one response per
   request (no ACK), and all reliability state at the initiator (per-packet RTO).
-  Used for idempotent RMA. Selected by setting `UET_FORCE_RUDI=1` on the `rma`
-  command and it requires the target memory region to be `IDEMPOTENT_SAFE` as
-  well as the peer advertising support for the HPC profile.
+  Used for idempotent RMA. Selected per endpoint with the `UET_OPT_FORCE_RUDI`
+  option of `uet_ep_setopt()`, or for every endpoint by setting
+  `UET_FORCE_RUDI=1` (as on the `rma` command), and it requires the target
+  memory region to be `IDEMPOTENT_SAFE` as well as the peer advertising support
+  for the HPC profile.
 - **UUD** - Unreliable Unordered Delivery. A connectionless, best-effort
   single-packet datagram send (no PDC, no ACK, no retransmit - fire and forget).
   Selected by setting `UET_FORCE_UUD=1` on the `uud` command.
@@ -137,6 +139,23 @@ errors. These diagnostics remain suppressed by the normal standalone build for
 compatibility with its external libfabric headers. The target does not link or
 install additional binaries; it provides an early check for type-incorrect core
 code and is also run by the GitHub sanity workflow.
+
+### Verbs library for device models
+
+`libuet_verbs.so` (built by `make`) and the static archive `libuet_verbs.a`
+are the `ENABLE_VERBS=1` build of the SES, PDS and TSS layers. They are meant
+to be linked into a device model, such as an emulated NIC, that runs the
+transport as its firmware. They are compiled against the headers bundled in
+`libfabric_headers` and link nothing from libfabric, so neither needs a
+libfabric tree:
+
+```sh
+make libuet_verbs.a
+```
+
+A device model plugs in its own wire with `uet_nic_register_shim()` and
+`nic_resolve_nh` (see `nic_shim/uet_nic.h`) and maps guest memory with
+`uet_set_dma_translate()` (see `uet_api.h`).
 
 ### rawsock
 
@@ -211,7 +230,7 @@ Replace `2` with the desired number of senders.
 
 - **LD_LIBRARY_PATH** - Needed for dynamic linking to the `libfabric` and `libuet` libraries.
 - **UET_IFNAME** - The ifname of the interface to attach to.
-- **UET_NIC_SHIM** - [ `rawsock` | `xdp` ]
+- **UET_NIC_SHIM** - [ `rawsock` | `xdp` | *name of a registered shim* ] A device model can supply its own shim with `uet_nic_register_shim()` (see `nic_shim/uet_nic.h`); a registered shim is the default when this is not set.
 - **UET_PDS** - [ `sng` | `pds` ] (default=`sng` stop-n-go)
 - **UET_PDS_PER_PKT_ACK_ENB** - [ `0` | `1` ] (default=`0`)
 - **UET_PDS_ACK_TYPE** - [ `ack` | `ack_cc` | `ack_ccx` ] (default=`ack`)
@@ -219,7 +238,7 @@ Replace `2` with the desired number of senders.
 - **UET_PDS_MAX_TX_RETRIES** - Max number of times a Tx packet is retransmitted before failing (default=`5`).
 - **UET_NUM_ITERATIONS** - Override the number of message iterations the test app runs (default=`100`). Used to wall-clock-size a run (e.g., long enough to span several TSS key rotations).
 - **UET_MSG_SIZE** - Override the message size used by the test app (default=`4096`).
-- **UET_FORCE_RUDI** - [ `0` | `1` ] (default=`0`) Force the RUDI (Reliable Unordered Delivery for Idempotent operations) PDS delivery mode for RMA read/write operations.
+- **UET_FORCE_RUDI** - [ `0` | `1` ] (default=`0`) Force the RUDI (Reliable Unordered Delivery for Idempotent operations) PDS delivery mode for RMA read/write operations. This is the default for new endpoints; `uet_ep_setopt(UET_OPT_FORCE_RUDI)` overrides it per endpoint.
 - **UET_FORCE_UUD** - [ `0` | `1` ] (default=`0`) Force the UUD (Unreliable Unordered Delivery) best-effort single-packet datagram PDS delivery mode for an untagged send.
 - **UET_SEC_MODE** - [ `direct` | `cluster` | `server` ]
 - **UET_SEC_SSI** - The SSI to be used for crypto operations. This value must be unique for all instances of `uet`. If not set the source IP address will be used instead as the source identifier.

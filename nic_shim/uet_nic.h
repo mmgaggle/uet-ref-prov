@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <assert.h>
 #include <errno.h>
 #include <net/if.h>
@@ -79,6 +80,7 @@ struct uet_nic {
 
 	int sock_fd;                    /* socket fd for ioctl calls */
 	void *nic_priv_data;
+	void *shim_ctx;     /* context given to uet_nic_register_shim() */
 
 	/* function pointers supporting different NIC interfaces */
 	int (*nic_getinfo)(struct uet_nic *nic,
@@ -94,7 +96,85 @@ struct uet_nic {
 	int (*nic_rx_poll)(struct uet_nic *nic);
 	void (*nic_finalize)(struct uet_nic *nic);
 	int (*nic_initialize)(struct uet_nic *nic);
+	/* optional, see struct uet_nic_shim_ops */
+	int (*nic_resolve_nh)(struct uet_nic *nic,
+			      const struct uet_fa *fa,
+			      bool is_ipv6,
+			      uint8_t *mac);
 };
+
+/*
+ * A NIC shim supplied by the application rather than built into the library.
+ *
+ * This is for a device model that carries UET frames over a transport of its
+ * own, for example an emulated NIC that owns a TAP interface and must keep
+ * every packet on the thread that services its guest. The library cannot
+ * know about such a transport, so the device model hands over the callbacks
+ * the built-in shims provide.
+ *
+ * The callbacks have the same contracts as the struct uet_nic members of the
+ * same name. nic_initialize() must fill in the addressing and size fields of
+ * struct uet_nic (ifname, network_type, mac_addr, mac_addr_str, ipv4_addr,
+ * has_ipv4, ipv6_addr, has_ipv6, mtu, l2_hdr_size, min_pkt_size,
+ * min_ip_pkt_size, max_pkt_size) exactly as the built-in shims do. The
+ * context given at registration is available to every callback as
+ * nic->shim_ctx.
+ */
+struct uet_nic_shim_ops {
+	const char *name;                     /* matched against UET_NIC_SHIM */
+	int (*nic_initialize)(struct uet_nic *nic);
+	void (*nic_finalize)(struct uet_nic *nic);
+	int (*nic_getinfo)(struct uet_nic *nic,
+			   struct uet_nic_info *nic_info);
+	int (*nic_tx_pkt)(struct uet_nic *nic,
+			  void *pkt,
+			  void *iphdr,
+			  size_t pkt_size);
+	int (*nic_rx_pkt)(struct uet_nic *nic,
+			  void *pkt,
+			  size_t pkt_buf_size,
+			  size_t *rx_pkt_size);
+	int (*nic_rx_poll)(struct uet_nic *nic);
+
+	/*
+	 * Optional next-hop resolver. When it is NULL the library resolves
+	 * the next hop itself by running "ip route", pinging the next hop
+	 * and reading the kernel ARP or neighbor cache, which blocks for as
+	 * long as those take and needs the interface to be a kernel netdev.
+	 *
+	 * A resolver must not block. It returns 0 with the next-hop MAC
+	 * address in mac, -EAGAIN when it has started a resolution that has
+	 * not finished (the operation that needed it fails with -FI_EAGAIN
+	 * and the caller retries it later), or another negative errno when
+	 * the destination is unreachable.
+	 */
+	int (*nic_resolve_nh)(struct uet_nic *nic,
+			      const struct uet_fa *fa,
+			      bool is_ipv6,
+			      uint8_t *mac);
+};
+
+/*
+ * register an application supplied NIC shim
+ *
+ * Must be called before uet_initialize(). The shim is used when the
+ * UET_NIC_SHIM environment variable names it, or when UET_NIC_SHIM is not
+ * set, so registering a shim makes it the default. One external shim can be
+ * registered at a time, and the registration lasts until it is replaced or
+ * cleared. The ops structure is referenced, not copied, and must outlive
+ * every instance that uses it.
+ *
+ * parms:
+ *      ops - shim callbacks, or NULL to clear the registration
+ *      ctx - opaque context made available to the callbacks as
+ *            nic->shim_ctx
+ *
+ * returns:
+ *      0 on success
+ *      -EINVAL if a required callback is missing
+ *      -EEXIST if the name is that of a built-in shim
+ */
+int uet_nic_register_shim(const struct uet_nic_shim_ops *ops, void *ctx);
 
 /*********************************************************************
  * NIC APIs
@@ -230,6 +310,12 @@ static inline int uet_nic_get_ipv4_nh(struct uet_nic *nic,
 	if (!nic || !mac)
 		assert(0);
 
+	if (nic->nic_resolve_nh) {
+		struct uet_fa fa = { .v4 = dst_ip };
+
+		return nic->nic_resolve_nh(nic, &fa, false, mac);
+	}
+
 	return uet_nic_resolve_ipv4_nh(nic, nic->sock_fd, dst_ip, mac);
 }
 
@@ -251,6 +337,13 @@ static inline int uet_nic_get_ipv6_nh(struct uet_nic *nic,
 {
 	if (!nic || !dst_ip6 || !mac)
 		assert(0);
+
+	if (nic->nic_resolve_nh) {
+		struct uet_fa fa;
+
+		memcpy(fa.v6, dst_ip6, UET_IPV6_ADDR_OCTETS);
+		return nic->nic_resolve_nh(nic, &fa, true, mac);
+	}
 
 	return uet_nic_resolve_ipv6_nh(nic, dst_ip6, mac);
 }

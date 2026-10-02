@@ -583,6 +583,8 @@ struct uet_instance {
 	struct uet_tx_rtr_token_cb tx_rtr_token_cb;
 	struct uet_rw_lock ep_lkup_lock;            /* lock for ep lookup tbl */
 	struct uet_ep *ep_hash_table;                  /* endpoint hash table */
+	uet_dma_translate_t dma_translate;     /* NULL => dma addr is a VA */
+	void *dma_translate_ctx;              /* passed to dma_translate() */
 };
 
 /* memory region descriptor allocation control block struct */
@@ -696,6 +698,7 @@ struct uet_ep {
 	uint32_t job_id;                                /* ses job identifier */
 	uint16_t entropy;             /* stable endpoint entropy value (EV) */
 	bool absolute;       /* endpoint uses absolute addressing (any JobID) */
+	bool force_rudi;      /* idempotent RMA goes RUDI, UET_OPT_FORCE_RUDI */
 			     /* relative endpoints demux/authorize by JobID   */
 	uint8_t untagged_gen;            /* ses generation for untagged msg's */
 	bool untagged_gen_disabled;  /* true=>gen disabled for untagged msg's */

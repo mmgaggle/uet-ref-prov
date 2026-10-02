@@ -85,6 +85,26 @@ typedef void *uet_mr_handle_t;      /* handle for memory region */
 typedef uint64_t uet_dma_addr_t;
 
 /*
+ * Translate a range of dma addresses into a pointer this process can
+ * dereference, for an implementation running as a device model.
+ *
+ * parms:
+ *   ctx   - context given to uet_set_dma_translate()
+ *   addr  - first dma address of the range
+ *   len   - length of the range in bytes. The library never asks for a
+ *           range that crosses a page of the region it is resolving.
+ *   write - true when the library will store through the result, false
+ *           when it will only load from it
+ *
+ * returns:
+ *   a pointer to the first byte of the range, valid for len bytes until
+ *   the region is closed, or NULL when the range cannot be accessed that
+ *   way, which fails the operation that needed it
+ */
+typedef void *(*uet_dma_translate_t)(void *ctx, uet_dma_addr_t addr,
+				     size_t len, bool write);
+
+/*
  * One segment of a local buffer, naming a range within a memory region.
  *
  * A local buffer is an array of these. Each element carries its own region,
@@ -135,6 +155,28 @@ typedef void (*uet_eq_err_callback_t)(uet_handle_t handle,
  *   negative value corresponding to fabric errno on error
  */
 int uet_initialize(uet_handle_t *handle);
+
+/*
+ * install a dma address translator
+ *
+ * Page buffer list regions (uet_mr_reg_pbl()) name their directories and
+ * pages by dma address. By default a dma address is taken to be an address
+ * in this process. A device model that serves memory it does not own
+ * installs a translator here, after uet_initialize() and before
+ * registering any page list region, and every access to such a region then
+ * goes through it.
+ *
+ * parms:
+ *   handle    - handle identifying uet instance
+ *   translate - the translator, or NULL to go back to process addresses
+ *   ctx       - passed to every call of translate
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+int uet_set_dma_translate(uet_handle_t handle, uet_dma_translate_t translate,
+			  void *ctx);
 
 /*
  * free resources of uet instance
@@ -850,6 +892,20 @@ int uet_ep_control(uet_ep_handle_t ep_handle, int command, void *arg);
  */
 int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 		  const void *optval, size_t optlen);
+
+/*
+ * Provider specific FI_OPT_ENDPOINT options for uet_ep_setopt().
+ *
+ * UET_OPT_FORCE_RUDI (bool)
+ *   Carry RMA writes without immediate data, and RMA reads, over the RUDI
+ *   delivery mode instead of RUD/ROD, provided the remote key is
+ *   IDEMPOTENT_SAFE and the peer advertises the HPC profile; otherwise the
+ *   operation falls back to the endpoint's normal mode. The choice is made
+ *   when an operation is posted, so changing the option between posts
+ *   selects the mode per operation. Defaults to whether UET_FORCE_RUDI is
+ *   set in the environment when the endpoint is created.
+ */
+#define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
 
 /*
  * discard everything an endpoint has outstanding, ahead of closing it
