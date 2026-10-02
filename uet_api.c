@@ -1333,6 +1333,10 @@ static void uet_tx_desc_list_insert(struct uet_tx_desc *tx_desc)
 		tx_desc->buf_desc.seg.seg_count = 0;
 	}
 
+	/* and a payload gathered for a send that never went */
+	free(tx_desc->staged_buf);
+	tx_desc->staged_buf = NULL;
+
 	tx_desc->state = UET_TX_DESC_STATE_INACTIVE;
 	tx_desc->desc_flags = UET_TX_DESC_FLAG_NONE;
 	tx_desc->pkt_cnt = 0;
@@ -5687,14 +5691,29 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			}
 		}
 
+		if (((tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) ||
+		     (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV)) &&
+		    (tx_desc->staged_buf != NULL)) {
+			/* the payload a full window turned away last time */
+			if ((tx_desc->staged_off == tx_desc->buf_desc.buf_off) &&
+			    (tx_desc->staged_len == payload_len)) {
+				pkt_buf = tx_desc->staged_buf;
+				tx_desc->staged_buf = NULL;
+				goto gathered;
+			}
+			free(tx_desc->staged_buf);
+			tx_desc->staged_buf = NULL;
+		}
+
 		if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) {
 			/* The segment walk is positioned by absolute offset
 			 * rather than by a saved offset, so it needs how far
 			 * into the message this packet starts. buf_off is
 			 * that, and is what the iov path uses too - it is
 			 * advanced and reset alongside remaining_bytes.
+			 * The gather writes every byte, or the send fails.
 			 */
-			pkt_buf = calloc(payload_len, sizeof(char));
+			pkt_buf = malloc(payload_len ? payload_len : 1);
 			if (pkt_buf &&
 			    (gather_seg_to_flat(tx_desc->buf_desc.seg.seg,
 						tx_desc->buf_desc.seg.seg_count,
@@ -5730,6 +5749,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			pkt_buf = (void *) (((size_t) tx_desc->buf_desc.buf) +
 						tx_desc->buf_desc.buf_off);
 
+gathered:
 		uet_build_ses_hdr(tx_desc, pkt_len, ses);
 
 		rc = pds->downcall.tx_pkt((uet_pkt_handle_t) tx_desc,
@@ -5745,8 +5765,15 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 		 * into the caller's buffer and must not be freed.
 		 */
 		if ((tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_IOV) ||
-		    (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG))
-			free(pkt_buf);
+		    (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG)) {
+			if (rc == -FI_EAGAIN) {
+				tx_desc->staged_buf = pkt_buf;
+				tx_desc->staged_off = tx_desc->buf_desc.buf_off;
+				tx_desc->staged_len = payload_len;
+			} else {
+				free(pkt_buf);
+			}
+		}
 
 sent:
 		if (rc == FI_SUCCESS) {

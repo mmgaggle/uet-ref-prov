@@ -416,6 +416,13 @@ struct uet_tx_desc {
 #define UET_TX_DESC_FLAG_OWNS_SEG		(1 << 15)
 	int desc_flags;                          /* flags for this descriptor */
 	struct uet_msg_buf_desc buf_desc;                /* buffer descriptor */
+	     /* A packet's payload gathered out of an iov or segment list for  */
+	     /* a send the PDS turned away with EAGAIN (its window was full),  */
+	     /* kept for the retry instead of gathered again on every          */
+	     /* progress call. staged_off is the message offset it starts at.  */
+	void *staged_buf;
+	size_t staged_off;
+	size_t staged_len;
 	uint64_t pkt_cnt;                /* number of pkt tx for this message */
 	uint64_t tag_or_immdata;           /* tag or immediate data for write */
 	uint64_t remote_start_off;              /* remote starting buf offset */
