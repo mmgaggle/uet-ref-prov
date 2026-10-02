@@ -108,18 +108,15 @@ void uet_pds_rudi_finalize(void)
 	}
 }
 
-/* FIXME: get the security SDI/SSI, same source as uet_pdsm_get_sdi()! */
-static void uet_rudi_get_sec(bool *sec_enabled, uint32_t *sdi, uint32_t *ssi)
+/* FIXME: get the security SDI/SSI, same source as uet_pdsm_get_sdi()!
+ * Read from the environment once, by uet_initialize(). */
+static void uet_rudi_get_sec(const struct uet_instance *uet,
+			     bool *sec_enabled,
+			     uint32_t *sdi, uint32_t *ssi)
 {
-	char *sec_ssi;
-
-	*sec_enabled = !!getenv(UET_SEC_MODE);
+	*sec_enabled = uet->sec_enabled;
 	*sdi = 1; /* fixed SDI, matches the PDC path */
-	*ssi = 0;
-
-	sec_ssi = getenv(UET_SEC_SSI);
-	if (sec_ssi)
-		*ssi = strtoul(sec_ssi, NULL, 10);
+	*ssi = uet->sec_ssi;
 }
 
 /* The frame of a request whose payload is left in the message's buffer:
@@ -456,7 +453,7 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 		return -ENOSYS;
 	}
 
-	uet_rudi_get_sec(&sec_enabled, &sdi, &ssi);
+	uet_rudi_get_sec(uet, &sec_enabled, &sdi, &ssi);
 
 	rp = calloc(1, sizeof(*rp));
 	if (rp == NULL)
@@ -531,7 +528,7 @@ int uet_pds_rudi_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
 	    (ref->len == 0) || imp_shim_is_enabled())
 		return -ENOTSUP;
 
-	uet_rudi_get_sec(&sec_enabled, &sdi, &ssi);
+	uet_rudi_get_sec(uet, &sec_enabled, &sdi, &ssi);
 	if (sec_enabled)
 		return -ENOTSUP;
 
@@ -629,7 +626,7 @@ static int uet_rudi_rx_req(struct uet_instance *uet,
 		return 0;
 	}
 
-	uet_rudi_get_sec(&sec_enabled, &sdi, &ssi);
+	uet_rudi_get_sec(uet, &sec_enabled, &sdi, &ssi);
 
 	/* build the RUDI response back to the initiator echoing pkt_id */
 

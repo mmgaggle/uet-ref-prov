@@ -42,18 +42,15 @@ struct uet_uud_pkt {
 	bool      is_ipv6;
 };
 
-/* FIXME: get the security SDI/SSI, same source as uet_pdsm_get_sdi()! */
-static void uet_uud_get_sec(bool *sec_enabled, uint32_t *sdi, uint32_t *ssi)
+/* FIXME: get the security SDI/SSI, same source as uet_pdsm_get_sdi()!
+ * Read from the environment once, by uet_initialize(). */
+static void uet_uud_get_sec(const struct uet_instance *uet,
+			    bool *sec_enabled,
+			    uint32_t *sdi, uint32_t *ssi)
 {
-	char *sec_ssi;
-
-	*sec_enabled = !!getenv(UET_SEC_MODE);
+	*sec_enabled = uet->sec_enabled;
 	*sdi = 1; /* fixed SDI, matches the PDC path */
-	*ssi = 0;
-
-	sec_ssi = getenv(UET_SEC_SSI);
-	if (sec_ssi)
-		*ssi = strtoul(sec_ssi, NULL, 10);
+	*ssi = uet->sec_ssi;
 }
 
 /* Apply CRC (no security) or security header + encryption, then transmit the
@@ -261,7 +258,7 @@ int uet_pds_uud_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 		return -ENOSYS;
 	}
 
-	uet_uud_get_sec(&sec_enabled, &sdi, &ssi);
+	uet_uud_get_sec(uet, &sec_enabled, &sdi, &ssi);
 
 	memset(&up, 0, sizeof(up));
 	up.sec_enabled = sec_enabled;

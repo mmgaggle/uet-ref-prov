@@ -576,6 +576,8 @@ struct uet_instance {
 	bool udp_encap;          /* transmit over UDP, else directly over IP */
 	size_t encap_len;      /* udp or entropy header, as udp_encap says */
 	bool tx_payload_iov;  /* RUDI payload goes to the NIC from the region */
+	bool sec_enabled;       /* UET_SEC_MODE was set at uet_initialize() */
+	uint32_t sec_ssi;                  /* and UET_SEC_SSI, or 0 if unset */
 	uet_dma_copy_t dma_copy;      /* NULL => memcpy into region memory */
 	void *dma_copy_ctx;                       /* passed to dma_copy() */
 	size_t max_payload_len;                   /* max payload for a packet */

@@ -6867,6 +6867,13 @@ static int uet_wire_config(struct uet_instance *uet)
 	if (rc > 0)
 		uet->pds.ack_gen_min_pkt_add = v;
 
+	/* The connectionless engines (RUDI, UUD) used to read these from
+	 * the environment on every packet. */
+	uet->sec_enabled = (getenv(UET_SEC_MODE) != NULL);
+	uet->sec_ssi = 0;
+	if (getenv(UET_SEC_SSI) != NULL)
+		uet->sec_ssi = strtoul(getenv(UET_SEC_SSI), NULL, 10);
+
 	/*
 	 * RUDI requests leave their payload where it is when the shim can
 	 * transmit a frame in pieces. TSS has to encrypt a copy, and the
