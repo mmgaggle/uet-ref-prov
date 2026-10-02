@@ -1805,6 +1805,33 @@ static int uet_pds_tx_nack(struct uet_instance *uet,
 	return rc;
 }
 
+/*
+ * transmit a packet whose payload stays in the message's buffer; only RUDI
+ * does that (see uet_pds_rudi_tx_pkt_ref()), everything else is -ENOTSUP
+ * and goes through uet_pds_tx_pkt() with a copy
+ */
+int uet_pds_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
+		       uint64_t pkt_cnt,
+		       struct uet_ep *uet_ep,
+		       uet_addr_handle_t dst_addr_handle,
+		       uet_pds_mode_t mode,
+		       uet_pds_tx_flags_t flags,
+		       struct uet_pds_info *pds_info,
+		       uint16_t msg_id,
+		       uet_pds_next_hdr_t next_hdr,
+		       void *ses,
+		       size_t ses_len,
+		       const struct uet_payload_ref *ref)
+{
+	if (mode != UET_PDS_MODE_RUDI)
+		return -ENOTSUP;
+
+	return uet_pds_rudi_tx_pkt_ref(tx_pkt_handle, pkt_cnt, uet_ep,
+				       dst_addr_handle, mode, flags,
+				       pds_info, msg_id, next_hdr, ses,
+				       ses_len, ref);
+}
+
 int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 		   uint64_t pkt_cnt,
 		   struct uet_ep *uet_ep,

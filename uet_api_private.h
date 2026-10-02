@@ -568,6 +568,9 @@ struct uet_instance {
 	uint16_t uet_udp_port;                     /* udp port number for uet */
 	bool udp_encap;          /* transmit over UDP, else directly over IP */
 	size_t encap_len;      /* udp or entropy header, as udp_encap says */
+	bool tx_payload_iov;  /* RUDI payload goes to the NIC from the region */
+	uet_dma_copy_t dma_copy;      /* NULL => memcpy into region memory */
+	void *dma_copy_ctx;                       /* passed to dma_copy() */
 	size_t max_payload_len;                   /* max payload for a packet */
 	struct uet_pds pds;			  /* pds control block struct */
 	uint8_t default_msg_ip_tos;               /* default ip tos for msg's */
@@ -714,6 +717,20 @@ struct uet_ep {
 	struct uet_sync_grp_src_fep_key sync_grp_src_fep_key;
 	struct uet_sync_grp_src_fep_entry *sync_grp_src_fep_hash_table;
 };
+
+struct uet_payload_ref;
+
+/*
+ * The pieces of a packet's payload left in the message's buffer, as
+ * pointers this process can read (see uet_pds.h). Returns how many, or
+ * -E2BIG when more than max_iov are needed, -ENOTSUP for a kind of region
+ * that has no pointers, -EFAULT when part of it cannot be reached.
+ */
+int uet_payload_iov(const struct uet_payload_ref *ref, struct iovec *iov,
+		    int max_iov);
+
+/* copy it into dst instead; returns the bytes copied */
+size_t uet_payload_copy(const struct uet_payload_ref *ref, void *dst);
 
 /* info associated with data to be carried in pds ack */
 struct uet_ack_d_info {

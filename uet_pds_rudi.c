@@ -57,7 +57,20 @@ struct uet_rudi_out_pkt {
 	bool               sec_hdr_built; /* sec header injected into pkt */
 	int                tx_retry_cnt;
 	time_t             tx_time;
+	/* payload left in the message's buffer (uet_pds_rudi_tx_pkt_ref()):
+	 * pkt holds the hdr_len bytes of headers only, pkt_len counts the
+	 * payload too, and crc is computed on the first send */
+	bool               has_ref;
+	struct uet_payload_ref ref;
+	int                hdr_len;
+	bool               crc_done;
+	uint32_t           crc;
 };
+
+/* headers, the payload's pieces (an 8 KiB payload spans at most three
+ * pages of a page list) and the CRC */
+#define UET_RUDI_MAX_IOV 16
+
 
 /* Outstanding RUDI requests are held in two structures kept in sync:
  *   out_ht   - uthash keyed by pkt_id, for response matching (rx_rsp).
@@ -109,6 +122,103 @@ static void uet_rudi_get_sec(bool *sec_enabled, uint32_t *sdi, uint32_t *ssi)
 		*ssi = strtoul(sec_ssi, NULL, 10);
 }
 
+/* The frame of a request whose payload is left in the message's buffer:
+ * gathered into one buffer, for a shim that cannot take it in pieces.
+ */
+static int uet_rudi_send_flat_ref(struct uet_instance *uet,
+				  struct uet_rudi_out_pkt *rp)
+{
+	size_t len = (size_t)rp->pkt_len + CRC_LEN;
+	uint8_t *f = malloc(len);
+	int rc;
+
+	if (f == NULL)
+		return -ENOMEM;
+	memcpy(f, rp->pkt, rp->hdr_len);
+	if (uet_payload_copy(&rp->ref, f + rp->hdr_len) != rp->ref.len) {
+		free(f);
+		return -EFAULT;
+	}
+	memcpy(f + rp->pkt_len, &rp->crc, CRC_LEN);
+	rc = uet_nic_tx_pkt(UET_NIC(uet), f, f + sizeof(struct ethhdr), len);
+	free(f);
+	return rc;
+}
+
+/* Transmit a request whose payload is left in the message's buffer: the
+ * headers, the payload where it is, and the CRC, as pieces. The payload is
+ * resolved again on every send, so a region taken away meanwhile fails
+ * the send instead of sending whatever its memory holds now.
+ */
+static int uet_rudi_send_ref(struct uet_instance *uet,
+			     struct uet_rudi_out_pkt *rp)
+{
+	struct iovec iov[UET_RUDI_MAX_IOV];
+	uint8_t *ip = rp->pkt + sizeof(struct ethhdr);
+	uint8_t *crc_start = ip + (rp->is_ipv6 ? 8 : 12);
+	uint32_t crc;
+	int n, i, rc;
+
+	n = uet_payload_iov(&rp->ref, iov + 1, UET_RUDI_MAX_IOV - 2);
+	if (n == -EFAULT) {
+		/* the region went away: wait out the timeout as for a loss */
+		uet_gettime(&rp->tx_time);
+		return n;
+	}
+	if (n == -E2BIG || n == -ENOTSUP) {
+		if (!rp->crc_done) {
+			/* the flat path still needs the CRC */
+			uint8_t *f = malloc(rp->ref.len);
+
+			if (f == NULL)
+				return -ENOMEM;
+			if (uet_payload_copy(&rp->ref, f) != rp->ref.len) {
+				free(f);
+				return -EFAULT;
+			}
+			crc = crc32c_update(crc32c_init(), crc_start,
+					    (uint32_t)(rp->pkt + rp->hdr_len -
+						       crc_start));
+			crc = crc32c_update(crc, f, (uint32_t)rp->ref.len);
+			rp->crc = crc32c_finish(crc);
+			rp->crc_done = true;
+			free(f);
+		}
+		rc = uet_rudi_send_flat_ref(uet, rp);
+		goto sent;
+	}
+	if (n < 0) {
+		uet_gettime(&rp->tx_time);
+		return n;
+	}
+
+	/* CRC over the IP source address through the payload, once: the
+	 * payload may not change while the operation is outstanding */
+	if (!rp->crc_done) {
+		crc = crc32c_update(crc32c_init(), crc_start,
+				    (uint32_t)(rp->pkt + rp->hdr_len -
+					       crc_start));
+		for (i = 1; i <= n; i++)
+			crc = crc32c_update(crc, iov[i].iov_base,
+					    (uint32_t)iov[i].iov_len);
+		rp->crc = crc32c_finish(crc);
+		rp->crc_done = true;
+	}
+
+	iov[0].iov_base = rp->pkt;
+	iov[0].iov_len = rp->hdr_len;
+	iov[n + 1].iov_base = &rp->crc;
+	iov[n + 1].iov_len = CRC_LEN;
+
+	rc = uet_nic_tx_pkt_iov(UET_NIC(uet), iov, n + 2,
+				(size_t)rp->pkt_len + CRC_LEN);
+	if (rc == -ENOTSUP)
+		rc = uet_rudi_send_flat_ref(uet, rp);
+sent:
+	uet_gettime(&rp->tx_time);
+	return rc;
+}
+
 /* Apply CRC (no security) or security header + encryption, then transmit the
  * frame. Mirrors uet_pds_sec_tx_pkt() but is PDC-free.
  */
@@ -127,6 +237,9 @@ static int uet_rudi_send(struct uet_instance *uet,
 	int enc_pkt_len;
 	uint8_t *enc_ip;
 	int rc;
+
+	if (rp->has_ref)
+		return uet_rudi_send_ref(uet, rp);
 
 	if (!rp->sec_enabled) {
 		rc = uet_parse_pkt(uet, rp->pkt, rp->pkt_len, &pp);
@@ -203,7 +316,9 @@ static int uet_rudi_send(struct uet_instance *uet,
 }
 
 /* Build a RUDI frame (request or response). Allocates a new pkt_buf and fills
- * in the cleartext packet (eth/ip/entropy/RUDI/SES/payload).
+ * in the cleartext packet (eth/ip/entropy/RUDI/SES/payload). With payload NULL
+ * and payload_len not 0 the payload is sent from elsewhere: the buffer holds
+ * the headers only, and the IP length counts the payload.
  */
 static int uet_rudi_build_frame(struct uet_instance *uet,
 				uint8_t tos,
@@ -236,7 +351,16 @@ static int uet_rudi_build_frame(struct uet_instance *uet,
 	else
 		src_ip.v4 = uet->nic.ipv4_addr;
 
-	rp->pkt_buf_len = (uet->nic.max_pkt_size * ((sec_enabled) ? 2 : 1));
+	hdr_len = (sizeof(struct ethhdr) +
+		   ip_hdr_size +
+		   uet_encap_len(uet) +
+		   sizeof(struct uet_pds_rudi_req) +
+		   ses_len);
+	if ((payload == NULL) && (payload_len != 0))
+		rp->pkt_buf_len = hdr_len;
+	else
+		rp->pkt_buf_len = (uet->nic.max_pkt_size *
+				   ((sec_enabled) ? 2 : 1));
 	rp->pkt_buf = calloc(1, rp->pkt_buf_len);
 	if (rp->pkt_buf == NULL) {
 		UET_PDS_ERR("RUDI: failed to alloc packet buffer");
@@ -258,13 +382,8 @@ static int uet_rudi_build_frame(struct uet_instance *uet,
 	ses_hdr = (rudi_hdr + 1);
 	pl = ((uint8_t *)ses_hdr + ses_len);
 
-	hdr_len = (sizeof(struct ethhdr) +
-		   ip_hdr_size +
-		   uet_encap_len(uet) +
-		   sizeof(struct uet_pds_rudi_req) +
-		   ses_len);
-
 	rp->pkt_len = (hdr_len + payload_len);
+	rp->hdr_len = hdr_len;
 
 	/* fill in the entropy */
 	uet_build_encap_hdr(uet, entropy_hdr, entropy);
@@ -281,7 +400,7 @@ static int uet_rudi_build_frame(struct uet_instance *uet,
 		memcpy(ses_hdr, ses, ses_len);
 
 	/* fill in the payload */
-	if (payload_len)
+	if (payload_len && (payload != NULL))
 		memcpy(pl, payload, payload_len);
 
 	/* IP header (crc_en=true only when security is disabled) */
@@ -377,6 +496,83 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 		    (sec_enabled) ? " (sec)" : "");
 
 	/* track for response matching (hash) + per-packet RTO (dlist) */
+	HASH_ADD(hh, rudi.out_ht, pkt_id, sizeof(rp->pkt_id), rp);
+	dlist_insert_tail(&rp->node, &rudi.rto_list);
+
+	return 0;
+}
+
+int uet_pds_rudi_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
+			    uint64_t pkt_cnt,
+			    struct uet_ep *uet_ep,
+			    uet_addr_handle_t dst_addr_handle,
+			    uet_pds_mode_t mode,
+			    uet_pds_tx_flags_t flags,
+			    struct uet_pds_info *pds_info,
+			    uint16_t msg_id,
+			    uet_pds_next_hdr_t next_hdr,
+			    void *ses,
+			    size_t ses_len,
+			    const struct uet_payload_ref *ref)
+{
+	struct uet_instance *uet = uet_ep->uet_domain->uet;
+	struct uet_av_entry *av = (struct uet_av_entry *)dst_addr_handle;
+	bool is_ipv6 = uet_addr_is_ipv6(av->addr);
+	struct uet_rudi_out_pkt *rp;
+	bool sec_enabled;
+	uint32_t sdi, ssi, pkt_id;
+	int rc;
+
+	(void)pkt_cnt;
+	(void)mode;
+	(void)flags;
+
+	if (!uet->tx_payload_iov || pds_info || (ref == NULL) ||
+	    (ref->len == 0) || imp_shim_is_enabled())
+		return -ENOTSUP;
+
+	uet_rudi_get_sec(&sec_enabled, &sdi, &ssi);
+	if (sec_enabled)
+		return -ENOTSUP;
+
+	rp = calloc(1, sizeof(*rp));
+	if (rp == NULL)
+		return -ENOMEM;
+
+	pkt_id = rudi.next_pkt_id++;
+
+	rc = uet_rudi_build_frame(uet, uet_ep->msg_ip_tos, uet_ep->entropy,
+				  av->nh_mac_addr,
+				  &av->addr->fa, is_ipv6, false,
+				  UET_PDS_TYPE_RUDI_REQ, next_hdr, pkt_id,
+				  ses, ses_len, NULL, ref->len, rp);
+	if (rc != 0) {
+		free(rp);
+		return rc;
+	}
+
+	rp->has_ref       = true;
+	rp->ref           = *ref;
+	rp->pkt_id        = pkt_id;
+	rp->tx_pkt_handle = tx_pkt_handle;
+	rp->msg_id        = msg_id;
+	rp->uet_ep        = uet_ep;
+	rp->sec_enabled   = false;
+	rp->sdi           = sdi;
+	rp->ssi           = ssi;
+	rp->is_ipv6       = is_ipv6;
+	rp->tx_retry_cnt  = 0;
+
+	rc = uet_rudi_send(uet, rp, false);
+	if (rc != 0) {
+		free(rp->pkt_buf);
+		free(rp);
+		return rc;
+	}
+
+	UET_PDS_DBG("RUDI TX REQ pkt_id %u msg_id %u len %d (payload in place)",
+		    pkt_id, msg_id, rp->pkt_len);
+
 	HASH_ADD(hh, rudi.out_ht, pkt_id, sizeof(rp->pkt_id), rp);
 	dlist_insert_tail(&rp->node, &rudi.rto_list);
 

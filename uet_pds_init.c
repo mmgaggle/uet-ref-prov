@@ -25,6 +25,15 @@ extern int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 			  uint16_t msg_id, uet_pds_next_hdr_t next_hdr,
 			  void *ses, size_t ses_len, void *pkt,
 			  size_t pkt_len, bool dma_rdy);
+extern int uet_pds_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
+			      uint64_t pkt_cnt,
+			      struct uet_ep *uet_ep,
+			      uet_addr_handle_t dst_addr_handle,
+			      uet_pds_mode_t mode, uet_pds_tx_flags_t flags,
+			      struct uet_pds_info *pds_info,
+			      uint16_t msg_id, uet_pds_next_hdr_t next_hdr,
+			      void *ses, size_t ses_len,
+			      const struct uet_payload_ref *ref);
 extern int uet_pds_progress_tx(struct uet_ep *uet_ep,
 			       uet_pkt_handle_t *err_pkt_handle);
 extern int uet_pds_msg_cmpl_ind(struct uet_ep *uet_ep,
@@ -77,6 +86,7 @@ int uet_pds_init(struct uet_instance *uet)
 		downcall->progress_rx   = uet_pds_sng_progress_rx;
 		downcall->ep_close_wait = uet_pds_sng_ep_close_wait;
 		downcall->ep_abort      = NULL; /* not supported */
+		downcall->tx_pkt_ref    = NULL; /* not supported */
 	} else if (strcmp(pds, "pds") == 0) {
 		downcall->initialize    = uet_pds_initialize;
 		downcall->finalize      = uet_pds_finalize;
@@ -84,6 +94,7 @@ int uet_pds_init(struct uet_instance *uet)
 		downcall->ep_finalize   = uet_pds_ep_finalize;
 		downcall->msg_cmpl_ind  = uet_pds_msg_cmpl_ind;
 		downcall->tx_pkt        = uet_pds_tx_pkt;
+		downcall->tx_pkt_ref    = uet_pds_tx_pkt_ref;
 		downcall->progress_tx   = uet_pds_progress_tx;
 		downcall->progress_rx   = uet_pds_progress_rx;
 		downcall->ep_close_wait = uet_pds_ep_close_wait;

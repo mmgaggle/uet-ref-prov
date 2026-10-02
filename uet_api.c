@@ -3421,10 +3421,21 @@ static size_t uet_mr_pbl_copy(const struct uet_mr_desc *mr_desc, size_t offset,
 		if (run == 0)
 			break;
 
-		if (into_mr)
-			memcpy(p, ((const uint8_t *)flat + done), run);
-		else
+		if (into_mr) {
+			const struct uet_instance *uet =
+				mr_desc->uet_dom->uet;
+
+			if (uet->dma_copy != NULL) {
+				if (uet->dma_copy(uet->dma_copy_ctx, p,
+						  ((const uint8_t *)flat +
+						   done), run) != 0)
+					break;
+			} else {
+				memcpy(p, ((const uint8_t *)flat + done), run);
+			}
+		} else {
 			memcpy(((uint8_t *)flat + done), p, run);
+		}
 
 		done += run;
 	}
@@ -3586,6 +3597,98 @@ static size_t gather_seg_to_flat(const struct uet_mr_seg *seg,
 				 size_t offset)
 {
 	return uet_seg_copy(seg, seg_count, dst, len, offset, false);
+}
+
+size_t uet_payload_copy(const struct uet_payload_ref *ref, void *dst)
+{
+	if (ref->seg == NULL) {
+		memcpy(dst, ((const uint8_t *)ref->buf + ref->offset),
+		       ref->len);
+		return ref->len;
+	}
+	return gather_seg_to_flat(ref->seg, ref->seg_count, dst, ref->len,
+				  ref->offset);
+}
+
+/* append a piece, merging it with the last when they are adjacent */
+static int uet_iov_add(struct iovec *iov, int n, int max_iov, void *p,
+		       size_t len)
+{
+	if ((n > 0) &&
+	    (((uint8_t *)iov[n - 1].iov_base + iov[n - 1].iov_len) ==
+	     (uint8_t *)p)) {
+		iov[n - 1].iov_len += len;
+		return n;
+	}
+	if (n == max_iov)
+		return -E2BIG;
+	iov[n].iov_base = p;
+	iov[n].iov_len = len;
+	return n + 1;
+}
+
+int uet_payload_iov(const struct uet_payload_ref *ref, struct iovec *iov,
+		    int max_iov)
+{
+	const struct uet_mr_seg *seg = ref->seg;
+	size_t i, within = ref->offset, done = 0;
+	int n = 0;
+
+	if (seg == NULL)
+		return uet_iov_add(iov, 0, max_iov,
+				   ((uint8_t *)ref->buf + ref->offset),
+				   ref->len);
+
+	/* locate the segment holding offset, as uet_seg_copy() does */
+	for (i = 0; i < ref->seg_count; i++) {
+		if (within < seg[i].len)
+			break;
+		within -= seg[i].len;
+	}
+
+	for (; (i < ref->seg_count) && (done < ref->len); i++) {
+		const struct uet_mr_desc *mr_desc =
+			(const struct uet_mr_desc *)seg[i].mr;
+		size_t avail = (seg[i].len - within);
+		size_t run = (avail < (ref->len - done)) ? avail
+							 : (ref->len - done);
+		size_t mr_off, piece;
+		void *p;
+
+		if ((mr_desc == NULL) ||
+		    !uet_mr_addr_to_offset(mr_desc, (seg[i].addr + within),
+					   run, &mr_off))
+			return -EFAULT;
+
+		while (run) {
+			switch (mr_desc->buf_desc.type) {
+			case UET_MR_BUF_TYPE_CONTIG:
+				p = ((uint8_t *)mr_desc->buf_desc.buf + mr_off);
+				piece = run;
+				break;
+			case UET_MR_BUF_TYPE_PBL:
+				p = uet_mr_pbl_resolve(mr_desc, mr_off, &piece,
+						       false);
+				if (p == NULL)
+					return -EFAULT;
+				if (piece > run)
+					piece = run;
+				break;
+			default:
+				return -ENOTSUP;
+			}
+
+			n = uet_iov_add(iov, n, max_iov, p, piece);
+			if (n < 0)
+				return n;
+			mr_off += piece;
+			run -= piece;
+			done += piece;
+		}
+		within = 0;
+	}
+
+	return (done == ref->len) ? n : -EFAULT;
 }
 
 /*
@@ -5548,6 +5651,42 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 			flags |= UET_PDS_FLAG_MAINTAIN_PDC;
 		}
 
+		/*
+		 * With a NIC shim that transmits frames in pieces, a RUDI
+		 * request's payload stays where it is: no copy into a packet
+		 * here or in the PDS, and none for a retransmission.
+		 */
+		if (uet_ep->uet_domain->uet->tx_payload_iov &&
+		    (pds->downcall.tx_pkt_ref != NULL) &&
+		    (tx_desc->pds_mode == UET_PDS_MODE_RUDI) &&
+		    (pkt_len != 0) && (ses_len == sizeof(struct uet_ses_req_std)) &&
+		    ((tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) ||
+		     (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_CONTIG))) {
+			struct uet_payload_ref ref;
+
+			memset(&ref, 0, sizeof(ref));
+			if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) {
+				ref.seg = tx_desc->buf_desc.seg.seg;
+				ref.seg_count = tx_desc->buf_desc.seg.seg_count;
+			} else {
+				ref.buf = tx_desc->buf_desc.buf;
+			}
+			ref.offset = tx_desc->buf_desc.buf_off;
+			ref.len = pkt_len;
+
+			uet_build_ses_hdr(tx_desc, pkt_len, ses);
+			rc = pds->downcall.tx_pkt_ref(
+				(uet_pkt_handle_t) tx_desc, tx_desc->pkt_cnt,
+				uet_ep, tx_desc->dst_addr_handle,
+				tx_desc->pds_mode, flags, pds_info,
+				tx_desc->msg_id, next_hdr, ses, ses_len, &ref);
+			if (rc != -ENOTSUP) {
+				tx_desc->pkt_cnt++;
+				pkt_buf = NULL;
+				goto sent;
+			}
+		}
+
 		if (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) {
 			/* The segment walk is positioned by absolute offset
 			 * rather than by a saved offset, so it needs how far
@@ -5609,6 +5748,7 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 		    (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG))
 			free(pkt_buf);
 
+sent:
 		if (rc == FI_SUCCESS) {
 			tx_desc->unack_pkts++;
 			tx_desc->buf_desc.buf_off += payload_len;
@@ -6700,6 +6840,19 @@ static int uet_wire_config(struct uet_instance *uet)
 	if (rc > 0)
 		uet->pds.ack_gen_min_pkt_add = v;
 
+	/*
+	 * RUDI requests leave their payload where it is when the shim can
+	 * transmit a frame in pieces. TSS has to encrypt a copy, and the
+	 * impairment shim delays copies, so neither does.
+	 */
+	rc = uet_env_u32("UET_TX_ZERO_COPY", 0, 1, &v);
+	if (rc < 0)
+		return rc;
+	uet->tx_payload_iov = (UET_NIC(uet)->nic_tx_pkt_iov != NULL) &&
+			      (getenv(UET_SEC_MODE) == NULL) &&
+			      !imp_shim_is_enabled() &&
+			      ((rc == 0) || (v != 0));
+
 	return 0;
 }
 
@@ -6718,6 +6871,7 @@ int uet_get_wire_info(uet_handle_t handle, struct uet_wire_info *info)
 	info->ipproto = uet->uet_ipproto;
 	info->ack_gen_trigger = uet->pds.ack_gen_trigger;
 	info->ack_gen_min_pkt_add = uet->pds.ack_gen_min_pkt_add;
+	info->tx_zero_copy = uet->tx_payload_iov;
 	return FI_SUCCESS;
 }
 
@@ -6809,6 +6963,19 @@ int uet_set_dma_translate(uet_handle_t handle, uet_dma_translate_t translate,
 
 	uet->dma_translate = translate;
 	uet->dma_translate_ctx = (translate != NULL) ? ctx : NULL;
+
+	return FI_SUCCESS;
+}
+
+int uet_set_dma_copy(uet_handle_t handle, uet_dma_copy_t copy, void *ctx)
+{
+	struct uet_instance *uet = (struct uet_instance *) handle;
+
+	if (uet == NULL)
+		return -FI_EINVAL;
+
+	uet->dma_copy = copy;
+	uet->dma_copy_ctx = (copy != NULL) ? ctx : NULL;
 
 	return FI_SUCCESS;
 }

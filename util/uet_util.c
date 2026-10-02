@@ -671,7 +671,9 @@ void uet_build_ipv4_hdr(struct uet_instance *uet, struct iphdr *ipv4,
 	ipv4->saddr = sip;
 	ipv4->daddr = dip;
 	ipv4->check = 0;
-	ipv4->check = uet_ipv4_csum(ipv4);
+	/* a shim that fills in IPv4 checksums takes it from here */
+	if (!uet->nic.tx_ipv4_csum)
+		ipv4->check = uet_ipv4_csum(ipv4);
 	if (uet->udp_encap)
 		((struct udphdr *)(ipv4 + 1))->len =
 			htons(ntohs(ipv4->tot_len) - sizeof(*ipv4));

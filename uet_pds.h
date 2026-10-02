@@ -35,6 +35,19 @@ struct uet_instance;
 struct uet_av_entry;
 struct uet_tx_desc;
 
+/*
+ * The payload of one packet, left where the message's buffer is rather
+ * than copied: a contiguous buffer (seg is NULL), or a segment list. Both
+ * stay valid until the message completes.
+ */
+struct uet_payload_ref {
+	const void *buf;               /* contiguous payload, when seg is NULL */
+	const struct uet_mr_seg *seg;  /* segment list */
+	size_t seg_count;
+	size_t offset;   /* where the packet's payload starts in buf or seg */
+	size_t len;      /* payload bytes */
+};
+
 /* pds delivery modes */
 typedef enum {
 	UET_PDS_MODE_UUD,
@@ -167,6 +180,20 @@ struct uet_ses_to_pds_funcs {
 		      struct uet_pds_info *pds_info, uint16_t msg_id,
 		      uet_pds_next_hdr_t next_hdr, void *ses, size_t ses_len,
 		      void *pkt, size_t pkt_len, bool dma_rdy);
+
+	/*
+	 * Optional: tx_pkt() with the payload left in the message's buffer
+	 * (see struct uet_payload_ref), for a NIC shim that transmits frames
+	 * in pieces. Returns -ENOTSUP when it cannot, and the caller then
+	 * copies the payload and uses tx_pkt().
+	 */
+	int (*tx_pkt_ref)(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
+			  struct uet_ep *uet_ep,
+			  uet_addr_handle_t dst_addr_handle,
+			  uet_pds_mode_t mode, uet_pds_tx_flags_t flags,
+			  struct uet_pds_info *pds_info, uint16_t msg_id,
+			  uet_pds_next_hdr_t next_hdr, void *ses,
+			  size_t ses_len, const struct uet_payload_ref *ref);
 
 	/*
 	 * indicate message completion

@@ -46,6 +46,26 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 			size_t pkt_len,
 			bool dma_rdy);
 
+/*
+ * uet_pds_rudi_tx_pkt() with the payload left in the message's buffer: the
+ * frame goes to the NIC shim in pieces (uet_nic_tx_pkt_iov()), so neither
+ * the transmit nor a retransmission copies the payload. -ENOTSUP when the
+ * instance does not do that (TSS, the impairment shim, a shim without
+ * nic_tx_pkt_iov).
+ */
+int uet_pds_rudi_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
+			    uint64_t pkt_cnt,
+			    struct uet_ep *uet_ep,
+			    uet_addr_handle_t dst_addr_handle,
+			    uet_pds_mode_t mode,
+			    uet_pds_tx_flags_t flags,
+			    struct uet_pds_info *pds_info,
+			    uint16_t msg_id,
+			    uet_pds_next_hdr_t next_hdr,
+			    void *ses,
+			    size_t ses_len,
+			    const struct uet_payload_ref *ref);
+
 /* Progress RUDI engine intitiator side reliability. Driven from the PDS
  * engine's uet_pds_progress_tx().
  */

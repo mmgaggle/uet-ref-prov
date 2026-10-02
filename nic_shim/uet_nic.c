@@ -320,6 +320,10 @@ int uet_nic_getinfo(struct uet_nic *nic,
 /* Raw Socket NIC protocol callbacks */
 extern int nic_rawsock_getinfo(struct uet_nic *nic,
 			       struct uet_nic_info *nic_info);
+extern int nic_rawsock_tx_pkt_iov(struct uet_nic *nic,
+				  const struct iovec *iov,
+				  int iovcnt,
+				  size_t pkt_size);
 extern int nic_rawsock_tx_pkt(struct uet_nic *nic,
 			      void *pkt,
 			      void *iphdr,
@@ -394,6 +398,7 @@ int uet_nic_initialize(struct uet_nic *nic)
 		nic->nic_finalize    = ext_shim_ops->nic_finalize;
 		nic->nic_initialize  = ext_shim_ops->nic_initialize;
 		nic->nic_resolve_nh  = ext_shim_ops->nic_resolve_nh;
+		nic->nic_tx_pkt_iov  = ext_shim_ops->nic_tx_pkt_iov;
 		nic->shim_ctx        = ext_shim_ctx;
 		nic->sock_fd         = -1;
 
@@ -409,6 +414,7 @@ int uet_nic_initialize(struct uet_nic *nic)
 	if ((nic_shim == NULL) || (strcmp(nic_shim, "rawsock") == 0)) {
 		nic->nic_getinfo     = nic_rawsock_getinfo;
 		nic->nic_tx_pkt      = nic_rawsock_tx_pkt;
+		nic->nic_tx_pkt_iov  = nic_rawsock_tx_pkt_iov;
 		nic->nic_rx_pkt      = nic_rawsock_rx_pkt;
 		nic->nic_rx_poll     = nic_rawsock_rx_poll;
 		nic->nic_finalize    = nic_rawsock_finalize;

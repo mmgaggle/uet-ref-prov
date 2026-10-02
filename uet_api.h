@@ -173,6 +173,10 @@ int uet_initialize(uet_handle_t *handle);
  *                    raised to four and one quarter of a payload for
  *                    payloads over 4096 (up to the 32 KiB and 2 KiB the
  *                    specification allows).
+ *   UET_TX_ZERO_COPY "0" makes RUDI requests carry a copy of their payload
+ *                    even when the NIC shim can transmit a frame in
+ *                    pieces (nic_tx_pkt_iov), which it otherwise does
+ *                    without TSS and the impairment shim.
  */
 struct uet_wire_info {
 	uint32_t ip_mtu;	/* the NIC's IP MTU */
@@ -182,6 +186,7 @@ struct uet_wire_info {
 	uint8_t ipproto;	/* IP protocol, without UDP */
 	uint32_t ack_gen_trigger;
 	uint32_t ack_gen_min_pkt_add;
+	bool tx_zero_copy;	/* RUDI payload goes to the NIC from the region */
 };
 
 /*
@@ -214,6 +219,28 @@ int uet_get_wire_info(uet_handle_t handle, struct uet_wire_info *info);
  */
 int uet_set_dma_translate(uet_handle_t handle, uet_dma_translate_t translate,
 			  void *ctx);
+
+/*
+ * Copy len bytes received from the wire into region memory, at dst (a
+ * pointer from the translator). Returns 0, or a negative errno, which
+ * fails the packet as an unreachable address would.
+ */
+typedef int (*uet_dma_copy_t)(void *ctx, void *dst, const void *src,
+			      size_t len);
+
+/*
+ * install a copy engine for placing received payload in region memory
+ *
+ * A device model may have a DMA engine to place the payload of received
+ * packets into the memory its regions describe. The copy is synchronous:
+ * the library acknowledges the packet once it returns. Only page list
+ * regions use it. NULL restores memcpy().
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+int uet_set_dma_copy(uet_handle_t handle, uet_dma_copy_t copy, void *ctx);
 
 /*
  * free resources of uet instance

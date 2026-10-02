@@ -221,7 +221,8 @@ bool uet_pds_rx_pkt_chk(struct uet_instance *uet,
 			return false;
 		}
 
-		if (uet_ipv4_csum(ipv4) != 0) {
+		/* unless the shim has checked it already */
+		if (!uet->nic.rx_ipv4_csum && (uet_ipv4_csum(ipv4) != 0)) {
 			UET_PDS_WARN("IPv4 header checksum invalid");
 			return false;
 		}

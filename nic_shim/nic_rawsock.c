@@ -50,6 +50,43 @@ int nic_rawsock_getinfo(struct uet_nic *nic,
 }
 
 /* transmit a packet */
+/* the frame in pieces, see struct uet_nic_shim_ops: the kernel gathers it */
+int nic_rawsock_tx_pkt_iov(struct uet_nic *nic,
+			   const struct iovec *iov,
+			   int iovcnt,
+			   size_t pkt_size)
+{
+	struct ethhdr *eth = (struct ethhdr *)iov[0].iov_base;
+	struct rawsock_data *rdata =
+		(struct rawsock_data *)nic->nic_priv_data;
+	struct msghdr msg;
+	ssize_t len;
+
+	if ((iovcnt < 1) || (iov[0].iov_len < sizeof(*eth)))
+		return -ENOTSUP;
+
+	memcpy(rdata->sadr.sll_addr, eth->h_dest, ETH_ALEN);
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = &rdata->sadr;
+	msg.msg_namelen = sizeof(struct sockaddr_ll);
+	msg.msg_iov = (struct iovec *)iov;
+	msg.msg_iovlen = iovcnt;
+
+	len = sendmsg(rdata->sock_fd.fd, &msg, 0);
+	if (len != (ssize_t)pkt_size) {
+		if (len == -1)
+			UET_API_PRINT_ERRNO("sendmsg");
+		else
+			UET_API_ERR("Error transmitting packet, "
+				    "sent %ld of %ld bytes",
+				    len, pkt_size);
+		return -EIO;
+	}
+
+	return 0;
+}
+
 int nic_rawsock_tx_pkt(struct uet_nic *nic,
 		       void *pkt,
 		       void *iphdr,

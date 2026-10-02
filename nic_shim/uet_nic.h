@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <sys/uio.h>
 #include <linux/if_ether.h>
 
 #include "uet_addr.h"
@@ -78,6 +79,16 @@ struct uet_nic {
 
 	uint8_t uet_ipproto;           /* ip protocol number for uet */
 
+	/*
+	 * Offloads a shim may claim in nic_initialize(): it fills in the
+	 * IPv4 header checksum of every frame it transmits, so the library
+	 * leaves it 0 (tx_ipv4_csum), or it hands over only frames whose
+	 * IPv4 header checksum it has checked, so the library does not
+	 * check it again (rx_ipv4_csum).
+	 */
+	bool tx_ipv4_csum;
+	bool rx_ipv4_csum;
+
 	int sock_fd;                    /* socket fd for ioctl calls */
 	void *nic_priv_data;
 	void *shim_ctx;     /* context given to uet_nic_register_shim() */
@@ -101,6 +112,11 @@ struct uet_nic {
 			      const struct uet_fa *fa,
 			      bool is_ipv6,
 			      uint8_t *mac);
+	/* optional, see struct uet_nic_shim_ops */
+	int (*nic_tx_pkt_iov)(struct uet_nic *nic,
+			      const struct iovec *iov,
+			      int iovcnt,
+			      size_t pkt_size);
 };
 
 /*
@@ -152,6 +168,25 @@ struct uet_nic_shim_ops {
 			      const struct uet_fa *fa,
 			      bool is_ipv6,
 			      uint8_t *mac);
+
+	/*
+	 * Optional transmit of one frame in pieces, so the payload need not
+	 * be copied into the frame first. The pieces, in order, add up to
+	 * pkt_size bytes: iov[0] is the headers (Ethernet through SES) and
+	 * iov[iovcnt - 1] the 4-byte CRC trailer, both in the library's
+	 * memory and valid only for the call; the pieces between are the
+	 * payload in the region the operation names, valid as long as the
+	 * operation is (the region may not be written meanwhile), so a shim
+	 * may send from them after it returns. The IPv4 header in iov[0] is
+	 * complete, checksum included unless the shim claims tx_ipv4_csum.
+	 * Returns 0, or a negative errno; -ENOTSUP makes the library fall
+	 * back to nic_tx_pkt for that frame. When the callback is NULL every
+	 * frame goes through nic_tx_pkt.
+	 */
+	int (*nic_tx_pkt_iov)(struct uet_nic *nic,
+			      const struct iovec *iov,
+			      int iovcnt,
+			      size_t pkt_size);
 };
 
 /*
@@ -397,6 +432,22 @@ static inline int uet_nic_tx_pkt(struct uet_nic *nic,
 		assert(0);
 
 	return nic->nic_tx_pkt(nic, pkt, iphdr, pkt_size);
+}
+
+/*
+ * transmit a packet given as pieces, see struct uet_nic_shim_ops
+ *
+ * returns:
+ *	0 on success, -ENOTSUP when the shim cannot, or a negative errno
+ */
+static inline int uet_nic_tx_pkt_iov(struct uet_nic *nic,
+				     const struct iovec *iov,
+				     int iovcnt,
+				     size_t pkt_size)
+{
+	if (nic->nic_tx_pkt_iov == NULL)
+		return -ENOTSUP;
+	return nic->nic_tx_pkt_iov(nic, iov, iovcnt, pkt_size);
 }
 
 /*
