@@ -130,11 +130,47 @@ static int uetfi_mr_control(struct fid *fid, int command, void *arg)
 	return ret;
 }
 
+static int uetfi_mr_close_op(struct fid *fid)
+{
+	struct uetfi_domain *dom =
+		container_of(fid, struct uetfi_mr, mr_fid.fid)->dom;
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_mr_close(fid);
+	uetfi_unlock(dom);
+	return ret;
+}
+
+static int uetfi_mr_bind_op(struct fid *fid, struct fid *bfid, uint64_t flags)
+{
+	struct uetfi_domain *dom =
+		container_of(fid, struct uetfi_mr, mr_fid.fid)->dom;
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_mr_bind(fid, bfid, flags);
+	uetfi_unlock(dom);
+	return ret;
+}
+
+static int uetfi_mr_control_op(struct fid *fid, int command, void *arg)
+{
+	struct uetfi_domain *dom =
+		container_of(fid, struct uetfi_mr, mr_fid.fid)->dom;
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_mr_control(fid, command, arg);
+	uetfi_unlock(dom);
+	return ret;
+}
+
 static struct fi_ops uetfi_mr_fi_ops = {
 	.size = sizeof(struct fi_ops),
-	.close = uetfi_mr_close,
-	.bind = uetfi_mr_bind,
-	.control = uetfi_mr_control,
+	.close = uetfi_mr_close_op,
+	.bind = uetfi_mr_bind_op,
+	.control = uetfi_mr_control_op,
 	.ops_open = UETFI_NOSYS(int (*)(struct fid *, const char *, uint64_t,
 					void **, void *)),
 	.tostr = UETFI_NOSYS(int (*)(const struct fid *, char *, size_t)),
@@ -142,17 +178,13 @@ static struct fi_ops uetfi_mr_fi_ops = {
 				       void *, void *)),
 };
 
-static int uetfi_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
-			    uint64_t flags, struct fid_mr **mr_fid)
+static int uetfi_mr_regattr_locked(struct uetfi_domain *dom,
+				   const struct fi_mr_attr *attr,
+				   uint64_t flags, struct fid_mr **mr_fid)
 {
-	struct uetfi_domain *dom;
 	struct uetfi_mr *mr;
 	uint64_t key_flags = UET_MR_KEY_NONE;
 	int ret;
-
-	if (fid->fclass != FI_CLASS_DOMAIN || !attr || !mr_fid)
-		return -FI_EINVAL;
-	dom = container_of(fid, struct uetfi_domain, domain_fid.fid);
 
 	if (flags)
 		return -FI_EBADFLAGS;
@@ -204,6 +236,21 @@ static int uetfi_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
 	return 0;
 }
 
+static int uetfi_mr_regattr(struct fid *fid, const struct fi_mr_attr *attr,
+			    uint64_t flags, struct fid_mr **mr_fid)
+{
+	struct uetfi_domain *dom;
+	int ret;
+
+	if (fid->fclass != FI_CLASS_DOMAIN || !attr || !mr_fid)
+		return -FI_EINVAL;
+	dom = container_of(fid, struct uetfi_domain, domain_fid.fid);
+	uetfi_lock(dom);
+	ret = uetfi_mr_regattr_locked(dom, attr, flags, mr_fid);
+	uetfi_unlock(dom);
+	return ret;
+}
+
 static int uetfi_mr_regv(struct fid *fid, const struct iovec *iov,
 			 size_t count, uint64_t access, uint64_t offset,
 			 uint64_t requested_key, uint64_t flags,
@@ -247,9 +294,10 @@ static struct fi_ops_mr uetfi_mr_ops = {
  * address vector
  *
  * fi_av_insert() takes the 32-byte addresses fi_getname() returns.
- * Inserting a peer the first time resolves its next hop (the core runs
- * ip route/ping), so the same peer inserted again shares that entry.
- * A target needs no entry for the initiators that write to it.
+ * Inserting a peer the first time resolves its next hop (the core asks
+ * the kernel, which may have to ARP for it), so the same peer inserted
+ * again shares that entry. That resolution runs without the domain's
+ * lock. A target needs no entry for the initiators that write to it.
  *******************************************************************/
 
 struct uetfi_peer *uetfi_av_peer(struct uetfi_av *av, fi_addr_t addr)
@@ -278,10 +326,24 @@ static void uetfi_peer_unref(struct uetfi_av *av, struct uetfi_peer *peer)
 	free(peer);
 }
 
+static struct uetfi_peer *uetfi_av_find(struct uetfi_av *av,
+					 const uint8_t *wire)
+{
+	struct uetfi_peer *peer;
+
+	for (peer = av->peers; peer; peer = peer->next)
+		if (!memcmp(peer->wire, wire, UETFI_ADDR_LEN))
+			break;
+	return peer;
+}
+
+/* called with the domain's lock held; drops it while the core resolves a
+ * new peer */
 static int uetfi_av_insert_one(struct uetfi_av *av, const void *addr,
 			       fi_addr_t *fi_addr)
 {
-	struct uetfi_peer *peer;
+	struct uetfi_domain *dom = av->dom;
+	struct uetfi_peer *peer, *fresh;
 	struct uet_addr ua;
 	uint8_t wire[UETFI_ADDR_LEN];
 	size_t slot;
@@ -292,23 +354,36 @@ static int uetfi_av_insert_one(struct uetfi_av *av, const void *addr,
 		return ret;
 	uetfi_addr_encode(&ua, wire);
 
-	for (peer = av->peers; peer; peer = peer->next)
-		if (!memcmp(peer->wire, wire, UETFI_ADDR_LEN))
-			break;
-
+	peer = uetfi_av_find(av, wire);
 	if (!peer) {
-		peer = calloc(1, sizeof(*peer));
-		if (!peer)
+		fresh = calloc(1, sizeof(*fresh));
+		if (!fresh)
 			return -FI_ENOMEM;
-		peer->addr = ua;
-		memcpy(peer->wire, wire, UETFI_ADDR_LEN);
-		ret = uet_av_insert(av->dom->h, &peer->addr, &peer->h);
+		fresh->addr = ua;
+		memcpy(fresh->wire, wire, UETFI_ADDR_LEN);
+		/*
+		 * The core resolves the next hop here, which may wait on
+		 * ARP; writes and completion reads on the domain go on
+		 * meanwhile. The core keeps a pointer to fresh->addr, and
+		 * fresh is nobody else's until it is on the list.
+		 */
+		uetfi_unlock(dom);
+		ret = uet_av_insert(dom->h, &fresh->addr, &fresh->h);
+		uetfi_lock(dom);
 		if (ret) {
-			free(peer);
+			free(fresh);
 			return ret;
 		}
-		peer->next = av->peers;
-		av->peers = peer;
+		/* another thread may have inserted the same peer meanwhile */
+		peer = uetfi_av_find(av, wire);
+		if (peer) {
+			uet_av_remove(fresh->h);
+			free(fresh);
+		} else {
+			peer = fresh;
+			peer->next = av->peers;
+			av->peers = peer;
+		}
 	}
 
 	if (av->type == FI_AV_MAP) {
@@ -364,6 +439,7 @@ static int uetfi_av_insert(struct fid_av *av_fid, const void *addr,
 	if (flags & ~(FI_MORE | FI_SYNC_ERR))
 		return -FI_EBADFLAGS;
 
+	uetfi_lock(av->dom);
 	for (i = 0; i < count; i++) {
 		ret = uetfi_av_insert_one(av, (const uint8_t *) addr +
 					  i * UETFI_ADDR_LEN, &fa);
@@ -379,6 +455,7 @@ static int uetfi_av_insert(struct fid_av *av_fid, const void *addr,
 		if (fi_addr)
 			fi_addr[i] = fa;
 	}
+	uetfi_unlock(av->dom);
 	return inserted;
 }
 
@@ -393,6 +470,7 @@ static int uetfi_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 	if (flags)
 		return -FI_EBADFLAGS;
 
+	uetfi_lock(av->dom);
 	for (i = 0; i < count; i++) {
 		peer = uetfi_av_peer(av, fi_addr[i]);
 		if (!peer) {
@@ -413,6 +491,7 @@ static int uetfi_av_remove(struct fid_av *av_fid, fi_addr_t *fi_addr,
 		}
 		uetfi_peer_unref(av, peer);
 	}
+	uetfi_unlock(av->dom);
 	return ret;
 }
 
@@ -420,12 +499,17 @@ static int uetfi_av_lookup(struct fid_av *av_fid, fi_addr_t fi_addr,
 			   void *addr, size_t *addrlen)
 {
 	struct uetfi_av *av = container_of(av_fid, struct uetfi_av, av_fid);
-	struct uetfi_peer *peer = uetfi_av_peer(av, fi_addr);
+	struct uetfi_peer *peer;
 
-	if (!peer)
+	uetfi_lock(av->dom);
+	peer = uetfi_av_peer(av, fi_addr);
+	if (!peer) {
+		uetfi_unlock(av->dom);
 		return -FI_EINVAL;
+	}
 	memcpy(addr, peer->wire, *addrlen < UETFI_ADDR_LEN ?
 					 *addrlen : UETFI_ADDR_LEN);
+	uetfi_unlock(av->dom);
 	*addrlen = UETFI_ADDR_LEN;
 	return 0;
 }
@@ -440,19 +524,26 @@ static const char *uetfi_av_straddr(struct fid_av *av_fid, const void *addr,
 static int uetfi_av_close(struct fid *fid)
 {
 	struct uetfi_av *av = container_of(fid, struct uetfi_av, av_fid.fid);
+	struct uetfi_domain *dom = av->dom;
 	struct uetfi_peer *peer;
 	int ret;
 
-	if (av->refs)
+	uetfi_lock(dom);
+	if (av->refs) {
+		uetfi_unlock(dom);
 		return -FI_EBUSY;
+	}
 	while ((peer = av->peers)) {
 		ret = uet_av_remove(peer->h);
-		if (ret)
+		if (ret) {
+			uetfi_unlock(dom);
 			return ret;
+		}
 		av->peers = peer->next;
 		free(peer);
 	}
-	av->dom->refs--;
+	dom->refs--;
+	uetfi_unlock(dom);
 	free(av->table);
 	free(av->free_slots);
 	free(av);
@@ -519,7 +610,9 @@ static int uetfi_av_open(struct fid_domain *domain, struct fi_av_attr *attr,
 	av->av_fid.fid.context = context;
 	av->av_fid.fid.ops = &uetfi_av_fi_ops;
 	av->av_fid.ops = &uetfi_av_ops;
+	uetfi_lock(dom);
 	dom->refs++;
+	uetfi_unlock(dom);
 	*av_fid = &av->av_fid;
 	return 0;
 }
@@ -551,6 +644,7 @@ static int uetfi_domain_close(struct fid *fid)
 	ret = uet_domain_close(dom->h);
 	if (ret)
 		return ret;
+	pthread_mutex_destroy(&dom->lock);
 	fi_freeinfo(dom->core_info);
 	uetfi_core_put();
 	dom->fabric->refs--;
@@ -619,6 +713,7 @@ int uetfi_domain_open(struct fid_fabric *fabric, struct fi_info *info,
 	dom = calloc(1, sizeof(*dom));
 	if (!dom)
 		return -FI_ENOMEM;
+	pthread_mutex_init(&dom->lock, NULL);
 	ret = uetfi_if_query(name, &dom->ifinfo);
 	if (ret) {
 		UETFI_WARN(FI_LOG_DOMAIN, "%s is not usable (%s)\n", name,

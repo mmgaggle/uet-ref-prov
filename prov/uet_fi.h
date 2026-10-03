@@ -7,7 +7,12 @@
  * (see uet_core.h), which is compiled into the same library.
  *
  * Scope: RDM endpoints with RMA write (initiator) and remote write
- * (target), manual progress, FI_THREAD_DOMAIN. See README.md.
+ * (target), manual progress, FI_THREAD_SAFE. See README.md.
+ *
+ * Threads: every call on a domain or on an object of it runs under the
+ * domain's lock, with one exception. fi_av_insert() of a new peer resolves
+ * its next hop in the core (ARP, which can take a while) without the
+ * lock, so other threads write and read completions meanwhile.
  */
 
 #ifndef _UET_FI_H_
@@ -158,7 +163,18 @@ struct uetfi_domain {
 	struct uetfi_ep *ep;		/* the domain's endpoint, if open */
 	struct uetfi_dlist mr_list;	/* struct uetfi_mr */
 	int refs;			/* av, cq, ep and mr objects */
+	pthread_mutex_t lock;		/* see "Threads" above */
 };
+
+static inline void uetfi_lock(struct uetfi_domain *dom)
+{
+	pthread_mutex_lock(&dom->lock);
+}
+
+static inline void uetfi_unlock(struct uetfi_domain *dom)
+{
+	pthread_mutex_unlock(&dom->lock);
+}
 
 struct uetfi_mr {
 	struct fid_mr mr_fid;

@@ -380,13 +380,7 @@ static int uetfi_check_hints(uint32_t version, const struct fi_info *hints)
 
 	da = hints->domain_attr;
 	if (da) {
-		switch (da->threading) {
-		case FI_THREAD_UNSPEC:
-		case FI_THREAD_DOMAIN:
-			break;
-		default:
-			REJECT("only FI_THREAD_DOMAIN is supported\n");
-		}
+		/* every threading level: the provider is FI_THREAD_SAFE */
 		if (da->control_progress == FI_PROGRESS_AUTO ||
 		    da->data_progress == FI_PROGRESS_AUTO)
 			REJECT("only manual progress is supported\n");
@@ -550,7 +544,11 @@ static struct fi_info *uetfi_info_alloc(uint32_t version,
 	info->ep_attr->rx_ctx_cnt = 1;
 
 	info->domain_attr->name = strdup(ifinfo->name);
-	info->domain_attr->threading = FI_THREAD_DOMAIN;
+	/* thread safe, so whatever level was asked for is met */
+	info->domain_attr->threading =
+		(hints && hints->domain_attr &&
+		 hints->domain_attr->threading != FI_THREAD_UNSPEC) ?
+			hints->domain_attr->threading : FI_THREAD_SAFE;
 	info->domain_attr->control_progress = FI_PROGRESS_MANUAL;
 	info->domain_attr->data_progress = FI_PROGRESS_MANUAL;
 	info->domain_attr->resource_mgmt = FI_RM_ENABLED;

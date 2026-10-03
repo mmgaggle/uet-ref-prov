@@ -66,7 +66,14 @@ What differs from the reference core:
 Accepted hints: provider `uet`, `FI_EP_RDM`, caps from
 `FI_RMA | FI_WRITE | FI_REMOTE_WRITE | FI_REMOTE_COMM`, any mode bits
 (the provider requires none), `mr_mode` including `FI_MR_PROV_KEY`,
-`FI_THREAD_DOMAIN`, manual progress, `FI_AV_TABLE` or `FI_AV_MAP`.
+any threading level, manual progress, `FI_AV_TABLE` or `FI_AV_MAP`.
+
+The provider is `FI_THREAD_SAFE`, and reports the level the hints ask
+for (`FI_THREAD_SAFE` without one). Every call on a domain, or on an
+object of it, runs under the domain's lock, except the slow part of
+`fi_av_insert()`: resolving a new peer's next hop, which can wait on
+ARP, runs without it, so other threads write and read completions
+meanwhile.
 
 The netdev is `hints->domain_attr->name` if set, else `FI_UET_IFNAME`,
 else `UET_IFNAME`, else one `fi_info` for every interface that is up,
@@ -206,7 +213,7 @@ still be used directly.
   default resource index. Several processes on one host need separate
   interfaces and IP addresses: the raw socket receives every UET packet
   on its interface.
-* IPv4 only. `FI_THREAD_DOMAIN` only.
+* IPv4 only.
 * The core logs to stdout. Its raw socket also sees outgoing and
   non-UET frames, and the PDS warns about each of them.
 * Throughput between namespaces on veth: about 250 MiB/s for one

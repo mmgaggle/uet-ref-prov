@@ -146,10 +146,9 @@ static size_t uetfi_tx_read(struct uetfi_ep *ep, struct uetfi_cq *cq,
 	return n;
 }
 
-static ssize_t uetfi_cq_readfrom(struct fid_cq *cq_fid, void *buf,
-				 size_t count, fi_addr_t *src_addr)
+static ssize_t uetfi_cq_readfrom_locked(struct uetfi_cq *cq, void *buf,
+					size_t count, fi_addr_t *src_addr)
 {
-	struct uetfi_cq *cq = container_of(cq_fid, struct uetfi_cq, cq_fid);
 	struct uetfi_ep *ep;
 	char *out = buf;
 	size_t n = 0, i;
@@ -194,6 +193,18 @@ static ssize_t uetfi_cq_readfrom(struct fid_cq *cq_fid, void *buf,
 	return err ? -FI_EAVAIL : -FI_EAGAIN;
 }
 
+static ssize_t uetfi_cq_readfrom(struct fid_cq *cq_fid, void *buf,
+				 size_t count, fi_addr_t *src_addr)
+{
+	struct uetfi_cq *cq = container_of(cq_fid, struct uetfi_cq, cq_fid);
+	ssize_t ret;
+
+	uetfi_lock(cq->dom);
+	ret = uetfi_cq_readfrom_locked(cq, buf, count, src_addr);
+	uetfi_unlock(cq->dom);
+	return ret;
+}
+
 static ssize_t uetfi_cq_read(struct fid_cq *cq_fid, void *buf, size_t count)
 {
 	return uetfi_cq_readfrom(cq_fid, buf, count, NULL);
@@ -223,16 +234,14 @@ static void uetfi_err_copy(struct fi_cq_err_entry *dst,
 		dst->src_addr = FI_ADDR_NOTAVAIL;
 }
 
-static ssize_t uetfi_cq_readerr(struct fid_cq *cq_fid,
-				struct fi_cq_err_entry *buf, uint64_t flags)
+static ssize_t uetfi_cq_readerr_locked(struct uetfi_cq *cq,
+				       struct fi_cq_err_entry *buf)
 {
-	struct uetfi_cq *cq = container_of(cq_fid, struct uetfi_cq, cq_fid);
 	uint32_t api = cq->dom->fabric->fabric_fid.api_version;
 	struct fi_cq_err_entry e;
 	struct uetfi_ep *ep;
 	int i;
 
-	(void) flags;
 	for (i = 0; i < cq->neps; i++) {
 		ep = cq->eps[i];
 		if (!ep->enabled)
@@ -255,6 +264,19 @@ static ssize_t uetfi_cq_readerr(struct fid_cq *cq_fid,
 	return -FI_EAGAIN;
 }
 
+static ssize_t uetfi_cq_readerr(struct fid_cq *cq_fid,
+				struct fi_cq_err_entry *buf, uint64_t flags)
+{
+	struct uetfi_cq *cq = container_of(cq_fid, struct uetfi_cq, cq_fid);
+	ssize_t ret;
+
+	(void) flags;
+	uetfi_lock(cq->dom);
+	ret = uetfi_cq_readerr_locked(cq, buf);
+	uetfi_unlock(cq->dom);
+	return ret;
+}
+
 static const char *uetfi_cq_strerror(struct fid_cq *cq, int prov_errno,
 				     const void *err_data, char *buf,
 				     size_t len)
@@ -274,10 +296,15 @@ static const char *uetfi_cq_strerror(struct fid_cq *cq, int prov_errno,
 static int uetfi_cq_close(struct fid *fid)
 {
 	struct uetfi_cq *cq = container_of(fid, struct uetfi_cq, cq_fid.fid);
+	struct uetfi_domain *dom = cq->dom;
 
-	if (cq->neps)
+	uetfi_lock(dom);
+	if (cq->neps) {
+		uetfi_unlock(dom);
 		return -FI_EBUSY;
-	cq->dom->refs--;
+	}
+	dom->refs--;
+	uetfi_unlock(dom);
 	free(cq);
 	return 0;
 }
@@ -336,7 +363,9 @@ int uetfi_cq_open(struct fid_domain *domain, struct fi_cq_attr *attr,
 	cq->cq_fid.fid.context = context;
 	cq->cq_fid.fid.ops = &uetfi_cq_fi_ops;
 	cq->cq_fid.ops = &uetfi_cq_ops;
+	uetfi_lock(dom);
 	dom->refs++;
+	uetfi_unlock(dom);
 	*cq_fid = &cq->cq_fid;
 	return 0;
 }

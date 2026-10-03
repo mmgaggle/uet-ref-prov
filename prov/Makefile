@@ -119,7 +119,7 @@ $(LIB): $(GLUE_OBJ) $(CORE_OBJ) libuet-fi.map
 
 $(TEST): test_rma.c
 	@echo '  CC        $@'
-	@$(CC) $(OPT) -Wall -Wextra -o $@ $< $(LIBFABRIC_LIBS)
+	@$(CC) $(OPT) -Wall -Wextra -o $@ $< $(LIBFABRIC_LIBS) -lpthread
 
 clean:
 	@rm -rf obj ernic libuet-fi.so $(TEST)

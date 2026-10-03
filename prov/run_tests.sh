@@ -178,6 +178,29 @@ bad_key() {
 		 echo $?) "unregistered key reported as an error completion"
 }
 
+# FI_THREAD_SAFE: a writer thread keeps writing while the main thread
+# inserts a peer nobody answers, 10.89.0.99, and waits for ARP in the
+# provider. The writes must go on meanwhile; a write to the dead peer must
+# then fail at once.
+mt_insert() {
+	local A K B S dead rc=0 len=$((16 << 20))
+	rm -f "$TMP/addr"
+	inns ofi-a "$DIR/test_rma" -o "$TMP/addr" -t 60 target "$len" 1 \
+		> "$TMP/target.log" 2>&1 &
+	local tpid=$!
+	wait_file "$TMP/addr" || { result 1 "mt (target)"; return; }
+	read -r A K B S < "$TMP/addr"
+	# the address's IPv4 is in bytes 16-19
+	dead=${A:0:32}0a590063${A:40}
+	inns ofi-b "$DIR/test_rma" -t 60 mt "$A" "$K" "$B" "$len" "$dead" \
+		> "$TMP/w1.log" 2>&1 || rc=1
+	wait $tpid || rc=1
+	grep -a -h "^MT\|^DEAD\|^VERIFIED\|^TIMEOUT\|^completion error" \
+		"$TMP"/w1.log "$TMP"/target.log | sed 's/^/      /'
+	rm -f "$TMP"/w*.log
+	result $rc "FI_THREAD_SAFE: writes go on while fi_av_insert waits for ARP"
+}
+
 run() {
 	echo "== FI_PROVIDER_PATH=$DIR fi_info -p uet -v (in ofi-a)"
 	sudo ip netns exec ofi-a env FI_PROVIDER_PATH="$DIR" fi_info -p uet -v
@@ -192,6 +215,7 @@ run() {
 	pair
 	cutoff
 	bad_key
+	mt_insert
 	[ $FAILED = 0 ] && echo "all passed" || echo "some failed"
 	return $FAILED
 }

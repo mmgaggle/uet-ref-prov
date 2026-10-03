@@ -191,7 +191,7 @@ void uetfi_ep_post(struct uetfi_ep *ep)
 	}
 }
 
-static ssize_t uetfi_write_common(struct uetfi_ep *ep, const void *buf,
+static ssize_t uetfi_write_locked(struct uetfi_ep *ep, const void *buf,
 				  size_t len, fi_addr_t dest, uint64_t addr,
 				  uint64_t key, void *context, uint64_t flags,
 				  const uint64_t *data)
@@ -236,6 +236,21 @@ static ssize_t uetfi_write_common(struct uetfi_ep *ep, const void *buf,
 
 	uetfi_ep_post(ep);
 	return 0;
+}
+
+static ssize_t uetfi_write_common(struct uetfi_ep *ep, const void *buf,
+				  size_t len, fi_addr_t dest, uint64_t addr,
+				  uint64_t key, void *context, uint64_t flags,
+				  const uint64_t *data)
+{
+	struct uetfi_domain *dom = ep->dom;
+	ssize_t ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_write_locked(ep, buf, len, dest, addr, key, context, flags,
+				 data);
+	uetfi_unlock(dom);
+	return ret;
 }
 
 static ssize_t uetfi_write(struct fid_ep *ep_fid, const void *buf, size_t len,
@@ -334,7 +349,9 @@ static int uetfi_getname(fid_t fid, void *addr, size_t *addrlen)
 		*addrlen = UETFI_ADDR_LEN;
 		return -FI_ETOOSMALL;
 	}
+	uetfi_lock(ep->dom);
 	ret = uet_getname(ep->h, &ua);
+	uetfi_unlock(ep->dom);
 	if (ret)
 		return ret;
 	uetfi_addr_encode(&ua, addr);
@@ -587,15 +604,55 @@ static int uetfi_ep_setopt(fid_t fid, int level, int optname,
 static ssize_t uetfi_tx_size_left(struct fid_ep *ep_fid)
 {
 	struct uetfi_ep *ep = container_of(ep_fid, struct uetfi_ep, ep_fid);
+	ssize_t left;
 
-	return ep->tx_size - ep->ops_outstanding;
+	uetfi_lock(ep->dom);
+	left = ep->tx_size - ep->ops_outstanding;
+	uetfi_unlock(ep->dom);
+	return left;
+}
+
+static int uetfi_ep_close_op(struct fid *fid)
+{
+	struct uetfi_domain *dom =
+		container_of(fid, struct uetfi_ep, ep_fid.fid)->dom;
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_ep_close(fid);
+	uetfi_unlock(dom);
+	return ret;
+}
+
+static int uetfi_ep_bind_op(struct fid *fid, struct fid *bfid, uint64_t flags)
+{
+	struct uetfi_domain *dom =
+		container_of(fid, struct uetfi_ep, ep_fid.fid)->dom;
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_ep_bind(fid, bfid, flags);
+	uetfi_unlock(dom);
+	return ret;
+}
+
+static int uetfi_ep_control_op(struct fid *fid, int command, void *arg)
+{
+	struct uetfi_domain *dom =
+		container_of(fid, struct uetfi_ep, ep_fid.fid)->dom;
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_ep_control(fid, command, arg);
+	uetfi_unlock(dom);
+	return ret;
 }
 
 static struct fi_ops uetfi_ep_fi_ops = {
 	.size = sizeof(struct fi_ops),
-	.close = uetfi_ep_close,
-	.bind = uetfi_ep_bind,
-	.control = uetfi_ep_control,
+	.close = uetfi_ep_close_op,
+	.bind = uetfi_ep_bind_op,
+	.control = uetfi_ep_control_op,
 	.ops_open = UETFI_NOSYS(int (*)(struct fid *, const char *, uint64_t,
 					void **, void *)),
 	.tostr = UETFI_NOSYS(int (*)(const struct fid *, char *, size_t)),
@@ -624,11 +681,10 @@ static size_t uetfi_queue_size(size_t requested, size_t def)
 						  requested;
 }
 
-int uetfi_endpoint(struct fid_domain *domain, struct fi_info *info,
-		   struct fid_ep **ep_fid, void *context)
+static int uetfi_endpoint_locked(struct uetfi_domain *dom,
+				 struct fi_info *info, struct fid_ep **ep_fid,
+				 void *context)
 {
-	struct uetfi_domain *dom =
-		container_of(domain, struct uetfi_domain, domain_fid);
 	struct uetfi_dlist *it;
 	struct uetfi_ep *ep;
 	struct uet_addr ua;
@@ -737,6 +793,19 @@ err:
 		free(ep);
 	}
 	uetfi_core_release_ep();
+	return ret;
+}
+
+int uetfi_endpoint(struct fid_domain *domain, struct fi_info *info,
+		   struct fid_ep **ep_fid, void *context)
+{
+	struct uetfi_domain *dom =
+		container_of(domain, struct uetfi_domain, domain_fid);
+	int ret;
+
+	uetfi_lock(dom);
+	ret = uetfi_endpoint_locked(dom, info, ep_fid, context);
+	uetfi_unlock(dom);
 	return ret;
 }
 
