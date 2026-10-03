@@ -149,6 +149,7 @@ uint32_t crc32c_update_sw(uint32_t crc,
 #define CRC32C_POLY_REFLECTED	0x82f63b78u
 #define CRC32C_LONG		2048u
 #define CRC32C_SHORT		256u
+#define CRC32C_PF		512u /* bytes ahead to prefetch per stream */
 
 static uint32_t crc32c_long_shift[4][256];
 static uint32_t crc32c_short_shift[4][256];
@@ -229,6 +230,20 @@ static inline uint64_t crc32c_load64(const uint8_t *p)
 		const uint8_t *end = p + (stream);			\
 									\
 		do {							\
+			/* The data is usually cold (a payload the CRC	\
+			 * is the first to read), and three streams of	\
+			 * demand misses do not keep the memory system	\
+			 * busy: ask for the lines ahead. */		\
+			if (((uintptr_t)p & 63) == 0) {			\
+				_mm_prefetch((const char *)p + CRC32C_PF,	\
+					     _MM_HINT_T0);		\
+				_mm_prefetch((const char *)p + (stream) +	\
+						     CRC32C_PF,		\
+					     _MM_HINT_T0);		\
+				_mm_prefetch((const char *)p + 2 * (stream) +	\
+						     CRC32C_PF,		\
+					     _MM_HINT_T0);		\
+			}						\
 			c0 = _mm_crc32_u64(c0, crc32c_load64(p));	\
 			c1 = _mm_crc32_u64(c1,				\
 				crc32c_load64(p + (stream)));		\
