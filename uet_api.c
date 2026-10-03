@@ -9611,6 +9611,9 @@ int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
 	case UET_OPT_ABORT:
 		v = uet_ep->uet_domain->uet->pds.downcall.ep_abort != NULL;
 		break;
+	case UET_OPT_ABORT_OP:
+		v = uet_ep->uet_domain->uet->pds.downcall.msg_abort != NULL;
+		break;
 	default:
 		return -FI_ENOSYS;
 	}

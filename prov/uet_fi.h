@@ -75,6 +75,18 @@
 #define FI_UET_OPT_CLOSE_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5545U))
 
 /*
+ * fi_getopt(&ep->fid, FI_OPT_ENDPOINT, FI_UET_OPT_CANCEL_DISCARDS, &b, &len)
+ * with bool b: whether fi_cancel() of an outstanding write discards it.
+ * When true, fi_cancel(&ep->fid, context) returns 0 once nothing of the
+ * write will be sent again (the parts already delivered stay), and the
+ * write completes with FI_ECANCELED; -FI_ENOENT for a write that has
+ * completed, or none with that context. False on the cores that cannot
+ * take one operation back: the reference core with UET_PDS=sng, a
+ * rocm-ernic device without UET_ERNIC_CAP_ABORT_OP. See README.md.
+ */
+#define FI_UET_OPT_CANCEL_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5543U))
+
+/*
  * fi_control(&mr->fid, FI_UET_MR_REKEY, &key) with uint64_t key (or NULL):
  * give the region a new key, returned in key and by fi_mr_key() from then
  * on. The old key is dead when the call returns, as if the region had been
@@ -264,6 +276,8 @@ struct uetfi_op {
 	int err;
 	bool has_data;
 	bool silent;		/* completion only if it fails */
+	bool live;		/* posted, not finished */
+	bool cancelled;		/* by fi_cancel() */
 	struct uetfi_op *next;	/* pending queue or free list */
 };
 

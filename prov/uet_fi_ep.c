@@ -96,6 +96,7 @@ static void uetfi_op_finish(struct uetfi_ep *ep, struct uetfi_op *op)
 	} else {
 		ep->ops_outstanding--;
 	}
+	op->live = false;
 	op->next = ep->op_free;
 	ep->op_free = op;
 }
@@ -224,6 +225,7 @@ static ssize_t uetfi_write_locked(struct uetfi_ep *ep, const void *buf,
 	op->key = key;
 	op->peer = peer;
 	op->silent = ep->tx_selective && !(flags & FI_COMPLETION);
+	op->live = true;
 	if (data) {
 		op->has_data = true;
 		op->data = *data;
@@ -609,15 +611,101 @@ static int uetfi_ep_control(struct fid *fid, int command, void *arg)
 	}
 }
 
+/* take one queued write out of the pending queue */
+static void uetfi_pend_remove(struct uetfi_ep *ep, struct uetfi_op *op)
+{
+	struct uetfi_op **pp, *prev = NULL;
+
+	for (pp = &ep->pend_head; *pp; prev = *pp, pp = &(*pp)->next) {
+		if (*pp == op) {
+			*pp = op->next;
+			if (ep->pend_tail == op)
+				ep->pend_tail = prev;
+			op->next = NULL;
+			return;
+		}
+	}
+}
+
+/*
+ * fi_cancel(): the write with this context, if it is outstanding, sends
+ * nothing more. Its segments still in the core are taken back with
+ * uet_ep_abort_op() (one segment per call; all of an operation's carry
+ * its op as context), those not posted yet are dropped, and it completes
+ * with FI_ECANCELED once no segment of it is left. A segment the core has
+ * finished is not taken back: it landed, and its completion is collected
+ * as usual.
+ */
+static ssize_t uetfi_cancel_locked(struct uetfi_ep *ep, void *context)
+{
+	struct uetfi_op *op = NULL;
+	size_t i;
+	int ret;
+
+	for (i = 0; i < ep->tx_size; i++) {
+		if (ep->ops[i].live && !ep->ops[i].cancelled &&
+		    ep->ops[i].context == context) {
+			op = &ep->ops[i];
+			break;
+		}
+	}
+	if (!op)
+		return -FI_ENOENT;
+	/* what has completed is not taken back */
+	uetfi_ep_harvest(ep);
+	if (!op->live)
+		return -FI_ENOENT;	/* its completion is queued */
+
+	while (op->segs_out) {
+		ret = uet_ep_abort_op(ep->h, op);
+		if (ret == -FI_ENOENT)
+			break;	/* the rest finished; collected as usual */
+		if (ret)
+			return ret;	/* -FI_ENOSYS: sng cannot */
+		op->segs_out--;
+		ep->segs_inflight--;
+	}
+	if (op->posted < op->len) {
+		uetfi_pend_remove(ep, op);
+		op->posted = op->len;
+	}
+	op->cancelled = true;
+	op->err = FI_ECANCELED;
+	if (!op->segs_out)
+		uetfi_op_finish(ep, op);
+	/* others may post now that its segments are gone */
+	uetfi_ep_post(ep);
+	return 0;
+}
+
+static ssize_t uetfi_ep_cancel(fid_t fid, void *context)
+{
+	struct uetfi_ep *ep = container_of(fid, struct uetfi_ep, ep_fid.fid);
+	ssize_t ret;
+
+	if (fid->fclass != FI_CLASS_EP)
+		return -FI_EINVAL;
+	uetfi_lock(ep->dom);
+	ret = ep->enabled ? uetfi_cancel_locked(ep, context) : -FI_ENOENT;
+	uetfi_unlock(ep->dom);
+	return ret;
+}
+
 static int uetfi_ep_getopt(fid_t fid, int level, int optname, void *optval,
 			   size_t *optlen)
 {
 	struct uetfi_ep *ep = container_of(fid, struct uetfi_ep, ep_fid.fid);
 	size_t len = sizeof(bool);
 	bool can = false;
-	int ret;
+	int core_opt, ret;
 
-	if (level != FI_OPT_ENDPOINT || optname != FI_UET_OPT_CLOSE_DISCARDS)
+	if (level != FI_OPT_ENDPOINT)
+		return -FI_ENOPROTOOPT;
+	if (optname == FI_UET_OPT_CLOSE_DISCARDS)
+		core_opt = UET_OPT_ABORT;
+	else if (optname == FI_UET_OPT_CANCEL_DISCARDS)
+		core_opt = UET_OPT_ABORT_OP;
+	else
 		return -FI_ENOPROTOOPT;
 	if (!optlen)
 		return -FI_EINVAL;
@@ -626,7 +714,7 @@ static int uetfi_ep_getopt(fid_t fid, int level, int optname, void *optval,
 		return -FI_ETOOSMALL;
 	}
 	uetfi_lock(ep->dom);
-	ret = uet_ep_getopt(ep->h, FI_OPT_ENDPOINT, UET_OPT_ABORT, &can, &len);
+	ret = uet_ep_getopt(ep->h, FI_OPT_ENDPOINT, core_opt, &can, &len);
 	uetfi_unlock(ep->dom);
 	if (ret == -FI_ENOSYS)
 		can = false;	/* a core that does not know the option */
@@ -709,7 +797,7 @@ static struct fi_ops uetfi_ep_fi_ops = {
 
 static struct fi_ops_ep uetfi_ep_ops = {
 	.size = sizeof(struct fi_ops_ep),
-	.cancel = UETFI_NOSYS(ssize_t (*)(fid_t, void *)),
+	.cancel = uetfi_ep_cancel,
 	.getopt = uetfi_ep_getopt,
 	.setopt = uetfi_ep_setopt,
 	.tx_ctx = UETFI_NOSYS(int (*)(struct fid_ep *, int, struct fi_tx_attr *,

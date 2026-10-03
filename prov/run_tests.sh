@@ -246,6 +246,36 @@ rekey() {
 	result $rc "FI_UET_MR_REKEY: the old key is dead at once, the new one works"
 }
 
+# fi_cancel(): two writes of 2 MiB each to one target while its link is
+# down; the first is cancelled, then the link comes back. The second must
+# complete and land; the first must complete with FI_ECANCELED and land
+# nothing, even once the link is back.
+cancel() {
+	local A K B S rc=0 len=$((4 << 20)) d=$TMP/cancel
+	rm -rf "$d" "$TMP/addr"
+	mkdir -p "$d"
+	inns ofi-a "$DIR/test_rma" -o "$TMP/addr" -t 60 cancel-target "$len" \
+		"$d" > "$TMP/target.log" 2>&1 &
+	local tpid=$!
+	wait_file "$TMP/addr" || { result 1 "cancel (target)"; return; }
+	read -r A K B S < "$TMP/addr"
+	inns ofi-b "$DIR/test_rma" -t 60 cancel-write "$A" "$K" "$B" "$len" \
+		"$d" > "$TMP/w1.log" 2>&1 &
+	local wpid=$!
+	for i in $(seq 200); do [ -e "$d/ready" ] && break; sleep 0.1; done
+	sudo ip netns exec ofi-a ip link set ofi0 down
+	touch "$d/go"
+	for i in $(seq 200); do [ -e "$d/cancelled" ] && break; sleep 0.05; done
+	sleep 0.5	# the other write is retransmitted meanwhile
+	sudo ip netns exec ofi-a ip link set ofi0 up
+	wait $wpid || rc=1
+	wait $tpid || rc=1
+	grep -a -h "^CANCEL\|^FI_CANCEL\|^COMPLETIONS\|^CANCELLED\|^FAILED\|^TIMEOUT\|^completion error" \
+		"$TMP"/w1.log "$TMP"/target.log | sed 's/^/      /'
+	rm -f "$TMP"/w*.log
+	result $rc "fi_cancel: one of two writes discarded, FI_ECANCELED"
+}
+
 run() {
 	echo "== FI_PROVIDER_PATH=$DIR fi_info -p uet -v (in ofi-a)"
 	sudo ip netns exec ofi-a env FI_PROVIDER_PATH="$DIR" fi_info -p uet -v
@@ -263,6 +293,7 @@ run() {
 	mt_insert
 	av_race
 	rekey
+	cancel
 	[ $FAILED = 0 ] && echo "all passed" || echo "some failed"
 	return $FAILED
 }

@@ -52,6 +52,18 @@
  *	must each fail at once, and inserting the subnet's broadcast address
  *	must not wait for ARP
  *
+ *   test_rma [opts] -o file cancel-target <size> <dir>
+ *	a window of <size> bytes; once a writer signals, wait a second for
+ *	stray retransmissions and report: the first half, whose write was
+ *	cancelled, must be zero, the second half must hold the pattern
+ *
+ *   test_rma [opts] cancel-write <addr-hex> <key-hex> <base> <size> <dir>
+ *	the writer of cancel-target: create <dir>/ready, wait for <dir>/go
+ *	(the target's link is taken down in between), write both halves of
+ *	the window at once, fi_cancel() the first after 100 ms and create
+ *	<dir>/cancelled (the link comes back); the second must complete, the
+ *	first must complete with FI_ECANCELED; then signal the target
+ *
  *   test_rma [opts] -o file rekey-target <size> <dir>
  *	a window of <size> bytes, as target lends it; once a writer has
  *	filled it and signalled, zero it and give it a new key with
@@ -113,17 +125,22 @@
 #endif
 #define FI_UET_OPT_CLOSE_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5545U))
 #define FI_UET_MR_REKEY ((int)(FI_PROV_SPECIFIC | 0x554bU))
+#define FI_UET_OPT_CANCEL_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5543U))
 
-/* whether fi_close() of the endpoint discards its writes */
-static bool close_discards(struct fid_ep *ep)
+static bool getopt_bool(struct fid_ep *ep, int opt)
 {
 	bool b = false;
 	size_t len = sizeof(b);
 
-	if (fi_getopt(&ep->fid, FI_OPT_ENDPOINT, FI_UET_OPT_CLOSE_DISCARDS, &b,
-		      &len))
+	if (fi_getopt(&ep->fid, FI_OPT_ENDPOINT, opt, &b, &len))
 		return false;
 	return b;
+}
+
+/* whether fi_close() of the endpoint discards its writes */
+static bool close_discards(struct fid_ep *ep)
+{
+	return getopt_bool(ep, FI_UET_OPT_CLOSE_DISCARDS);
 }
 
 struct opts {
@@ -201,6 +218,7 @@ static int unhex(const char *s, uint8_t *b, size_t max, size_t *n)
 static int open_ep(struct res *r, enum fi_cq_format format);
 static int poll_tx(struct res *r, size_t want, double deadline,
 		   int *signals);
+static bool dir_file(const char *dir, const char *name, bool create);
 
 static int setup(struct res *r, const struct opts *o,
 		 enum fi_cq_format format)
@@ -988,6 +1006,150 @@ static int wait_signals(struct res *r, int *signals, int want,
 	return 0;
 }
 
+static int run_cancel_target(const struct opts *o, size_t size,
+			     const char *dir)
+{
+	struct res r;
+	struct fid_mr *mr;
+	char h[2 * MAX_ADDR + 1];
+	uint8_t *win, *expect;
+	uint64_t base;
+	size_t half = size / 2, nz = 0, bad, first, i;
+	double deadline;
+	int signals = 0, ret;
+	FILE *f;
+
+	(void) dir;
+	memset(&r, 0, sizeof(r));
+	CHECK(setup(&r, o, FI_CQ_FORMAT_DATA));
+	win = aligned_alloc(4096, (size + 4095) & ~(size_t) 4095);
+	expect = malloc(size);
+	if (!win || !expect)
+		return -FI_ENOMEM;
+	memset(win, 0, size);
+	for (i = 0; i < size; i++)
+		expect[i] = pattern(i);
+	CHECK(reg(&r, win, size, FI_WRITE | FI_REMOTE_WRITE, &mr));
+	base = (r.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) ?
+	       (uintptr_t) win : 0;
+	hex(r.addr, r.addrlen, h);
+	if (o->outfile) {
+		f = fopen(o->outfile, "w");
+		if (!f)
+			return -errno;
+		fprintf(f, "%s %016" PRIx64 " %" PRIu64 " %zu\n", h,
+			fi_mr_key(mr), base, size);
+		fclose(f);
+	}
+	if (wait_signals(&r, &signals, 1, now() + o->timeout)) {
+		printf("TIMEOUT waiting for the writer\n");
+		return 1;
+	}
+	/* what is still on its way lands now, if anything does */
+	deadline = now() + 1;
+	while (now() < deadline)
+		fi_cq_read(r.cq, NULL, 0);
+	for (i = 0; i < half; i++)
+		nz += win[i] != 0;
+	bad = count_bad(win + half, expect + half, size - half, &first);
+	printf("CANCELLED HALF %zu of %zu bytes landed; OTHER HALF %zu of "
+	       "%zu bytes wrong\n", nz, half, bad, size - half);
+	CHECK(fi_close(&mr->fid));
+	free(expect);
+	free(win);
+	ret = teardown(&r);
+	return nz || bad ? 1 : ret;
+}
+
+static int run_cancel_write(const struct opts *o, const char *addr_hex,
+			    const char *key_hex, uint64_t base, size_t size,
+			    const char *dir)
+{
+	struct res r;
+	struct fi_context2 ctx[3];
+	struct fi_cq_err_entry err;
+	struct fi_cq_data_entry ce;
+	uint8_t peer_addr[MAX_ADDR], *src;
+	static const uint8_t zero[4096];
+	uint64_t key = strtoull(key_hex, NULL, 16);
+	size_t peer_len, half = size / 2, i;
+	fi_addr_t peer;
+	int ret, status[2] = {1, 1}, signals = 0, done = 0;
+	double t0, tc;
+	ssize_t n;
+	bool can;
+
+	if (unhex(addr_hex, peer_addr, sizeof(peer_addr), &peer_len))
+		return 2;
+	memset(&r, 0, sizeof(r));
+	CHECK(setup(&r, o, FI_CQ_FORMAT_DATA));
+	can = getopt_bool(r.ep, FI_UET_OPT_CANCEL_DISCARDS);
+	printf("CANCEL DISCARDS %s\n", can ? "yes" : "no");
+	src = malloc(size);
+	if (!src)
+		return -FI_ENOMEM;
+	for (i = 0; i < size; i++)
+		src[i] = pattern(i);
+	if (fi_av_insert(r.av, peer_addr, 1, &peer, 0, NULL) != 1)
+		return 1;
+	/* resolve the peer before the link goes; zeros, as the target
+	 * expects of the half that is cancelled */
+	CHECK(fi_write(r.ep, zero, sizeof(zero), NULL, peer, base, key,
+		       &ctx[2]));
+	CHECK(poll_tx(&r, 1, now() + o->timeout, &signals));
+	dir_file(dir, "ready", true);
+	while (!dir_file(dir, "go", false))
+		fi_cq_read(r.cq, NULL, 0);
+
+	CHECK(fi_write(r.ep, src, half, NULL, peer, base, key, &ctx[0]));
+	CHECK(fi_write(r.ep, src + half, size - half, NULL, peer, base + half,
+		       key, &ctx[1]));
+	t0 = now() + 0.1;
+	while (now() < t0)
+		fi_cq_read(r.cq, NULL, 0);
+	tc = now();
+	ret = (int) fi_cancel(&r.ep->fid, &ctx[0]);
+	tc = now() - tc;
+	printf("FI_CANCEL of the first write returned %s after %.3f ms\n",
+	       ret ? fi_strerror(-ret) : "0", tc * 1e3);
+	fflush(stdout);
+	dir_file(dir, "cancelled", true);
+	if (can != (ret == 0)) {
+		printf("FAILED fi_cancel() and FI_UET_OPT_CANCEL_DISCARDS "
+		       "disagree\n");
+		return 1;
+	}
+	if (ret) {
+		/* it could not: the write goes on; nothing more to check */
+		return 1;
+	}
+
+	t0 = now();
+	while (done < 2 && now() - t0 < o->timeout) {
+		n = fi_cq_read(r.cq, &ce, 1);
+		if (n == 1) {
+			status[ce.op_context == &ctx[0] ? 0 : 1] = 0;
+			done++;
+		} else if (n == -FI_EAVAIL) {
+			memset(&err, 0, sizeof(err));
+			if (fi_cq_readerr(r.cq, &err, 0) != 1)
+				return 1;
+			status[err.op_context == &ctx[0] ? 0 : 1] = err.err;
+			done++;
+		}
+	}
+	printf("COMPLETIONS cancelled write: %s; other write: %s\n",
+	       status[0] ? fi_strerror(status[0]) : "success",
+	       status[1] ? fi_strerror(status[1]) : "success");
+	if (status[0] != FI_ECANCELED || status[1] != 0)
+		return 1;
+	CHECK(fi_writedata(r.ep, NULL, 0, NULL, 1, peer, base, key, &ctx[2]));
+	CHECK(poll_tx(&r, 1, now() + o->timeout, &signals));
+	CHECK(fi_av_remove(r.av, &peer, 1, 0));
+	free(src);
+	return teardown(&r);
+}
+
 static int run_rekey_target(const struct opts *o, size_t size,
 			    const char *dir)
 {
@@ -1531,6 +1693,10 @@ static void usage(void)
 		"<key-hex> <base> <len> <dead-addr-hex>\n"
 		"       test_rma [-i ifname] [-c chunk] [-q depth] avrace "
 		"<addr-hex> <key-hex> <base> <len> <dead-addr-hex>\n"
+		"       test_rma [-i ifname] -o file cancel-target <size> "
+		"<dir>\n"
+		"       test_rma [-i ifname] cancel-write <addr-hex> "
+		"<key-hex> <base> <size> <dir>\n"
 		"       test_rma [-i ifname] -o file rekey-target <size> "
 		"<dir>\n"
 		"       test_rma [-i ifname] rekey-write <addr-hex> <key-hex> "
@@ -1586,6 +1752,13 @@ int main(int argc, char **argv)
 	else if (argc == 6 && !strcmp(argv[0], "mt"))
 		ret = run_mt(&o, argv[1], argv[2], strtoull(argv[3], NULL, 0),
 			     strtoull(argv[4], NULL, 0), argv[5]);
+	else if (argc == 3 && !strcmp(argv[0], "cancel-target"))
+		ret = run_cancel_target(&o, strtoull(argv[1], NULL, 0),
+					argv[2]);
+	else if (argc == 6 && !strcmp(argv[0], "cancel-write"))
+		ret = run_cancel_write(&o, argv[1], argv[2],
+				       strtoull(argv[3], NULL, 0),
+				       strtoull(argv[4], NULL, 0), argv[5]);
 	else if (argc == 3 && !strcmp(argv[0], "rekey-target"))
 		ret = run_rekey_target(&o, strtoull(argv[1], NULL, 0),
 				       argv[2]);

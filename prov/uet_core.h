@@ -39,6 +39,7 @@
 #endif
 #define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
 #define UET_OPT_ABORT ((int)(FI_PROV_SPECIFIC | 2U))
+#define UET_OPT_ABORT_OP ((int)(FI_PROV_SPECIFIC | 3U))
 
 typedef void *uet_handle_t;
 typedef void *uet_domain_handle_t;
@@ -84,6 +85,7 @@ int uet_ep_enable(uet_ep_handle_t ep_handle);
 int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
 		  void *optval, size_t *optlen);
 int uet_ep_abort(uet_ep_handle_t ep_handle);
+int uet_ep_abort_op(uet_ep_handle_t ep_handle, void *context);
 int uet_ep_close(uet_ep_handle_t ep_handle);
 int uet_ep_progress(uet_ep_handle_t ep_handle);
 

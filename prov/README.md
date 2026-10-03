@@ -236,6 +236,20 @@ atomic and collective operations return `-FI_ENOSYS`.
 
   It is false over `UET_PDS=sng`, and over a rocm-ernic device older
   than ABI version 2 or running `pds=sng`.
+* `fi_cancel(&ep->fid, context)` discards one outstanding write: when it
+  returns 0, nothing of that write is sent again (whatever reached the
+  target before stays), and the write completes with `FI_ECANCELED`,
+  usually by the time `fi_cancel()` returns, otherwise once its parts
+  the core had already finished are collected. Other writes go on. It
+  returns `-FI_ENOENT` for a write that has completed, or no write with
+  that context. Over RUD, a write cancelled with packets the target has
+  not acknowledged leaves holes in their PDC, which is closed, and other
+  RUD writes with packets on it fail; RUDI writes are cancelled alone.
+  Whether `fi_cancel()` can discard is the endpoint option
+  `FI_UET_OPT_CANCEL_DISCARDS`, `FI_PROV_SPECIFIC | 0x5543`, read like
+  `FI_UET_OPT_CLOSE_DISCARDS`. It is false over `UET_PDS=sng` and over a
+  rocm-ernic device without `UET_ERNIC_CAP_ABORT_OP`; `fi_cancel()` then
+  returns `-FI_ENOSYS` and the write goes on.
 * Errors are reported through `fi_cq_readerr`. Transport errors such as
   an unknown key, an out-of-range offset or exhausted retries all
   arrive as `FI_EIO`, because the core does not pass the SES return

@@ -1034,12 +1034,19 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 #define UET_OPT_ABORT ((int)(FI_PROV_SPECIFIC | 2U))
 
 /*
+ * UET_OPT_ABORT_OP (bool, read only, uet_ep_getopt())
+ *   Whether uet_ep_abort_op() can discard one operation. False when the
+ *   packet delivery sublayer cannot (UET_PDS=sng).
+ */
+#define UET_OPT_ABORT_OP ((int)(FI_PROV_SPECIFIC | 3U))
+
+/*
  * read an endpoint option
  *
  * parms:
  *   ep_handle - handle identifying uet endpoint instance
  *   level     - FI_OPT_ENDPOINT
- *   optname   - UET_OPT_FORCE_RUDI or UET_OPT_ABORT
+ *   optname   - UET_OPT_FORCE_RUDI, UET_OPT_ABORT or UET_OPT_ABORT_OP
  *   optval    - where the value goes
  *   optlen    - in: the room at optval; out: the value's size
  *
