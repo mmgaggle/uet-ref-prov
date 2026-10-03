@@ -702,9 +702,38 @@ static struct uet_pdc *uet_pdsm_alloc_pdc(void)
 	return pdc;
 }
 
+/* Free every packet a PDC window still holds, and empty it. */
+static void uet_pds_bm_free_pkts(struct bitmap *bm)
+{
+	struct uet_pdc_pkt *pdc_pkt;
+	int i, max;
+
+	if (bm == NULL)
+		return;
+
+	max = bm_max(bm);
+	for (i = 0; i <= max; i++) {
+		if (!bm_get(bm, i, (void **)&pdc_pkt))
+			continue;
+
+		bm_unset(bm, i);
+		free(pdc_pkt->ack_buf);
+		free(pdc_pkt->pkt_buf);
+		free(pdc_pkt);
+	}
+}
+
 static void uet_pdsm_free_pdc(struct uet_pdc *pdc)
 {
 	PDS_GO();
+
+	/* Received packets wait in the window, with their ACKs, to answer
+	 * duplicates until it shifts past them. A PDC freed before that
+	 * (closed by its initiator, say) would leave them for the next
+	 * uet_init_pdc() to clear without freeing. Transmitted packets are
+	 * gone by now: acknowledged and shifted out, or freed by an abort.
+	 */
+	uet_pds_bm_free_pkts(pdc->rx_bm);
 
 	UET_PDS_DBG("freeing PDC %u (state=UNALLOC) (is_initiator=%d)",
 		    pdc->pdc_id, pdc->is_initiator);
@@ -1659,9 +1688,9 @@ void uet_pds_finalize(struct uet_instance *uet)
 	UET_PDS_INFO("%-30s : %u", "pdc_close_in_err_cnt",
 		     pds_state.pdc_close_in_err_cnt);
 
-	/* TODO: reclaim/free all packets stored in the bitmaps... */
-
-	/* destory all allocated PDCs */
+	/* destory all allocated PDCs, and the packets they still hold: every
+	 * un-ACK'ed transmitted packet is in the tx window as well as on the
+	 * retransmit list, so freeing the windows frees them all once */
 	while (!dlist_empty(&pds_state.pdc_alloc_head)) {
 		dlist_pop_front(&pds_state.pdc_alloc_head,
 				struct uet_pdc, pdc, node);
@@ -1670,6 +1699,9 @@ void uet_pds_finalize(struct uet_instance *uet)
 			HASH_DELETE(pdc_ini_hh, pds_state.pdc_ini_ht, pdc);
 		else
 			HASH_DELETE(pdc_tgt_hh, pds_state.pdc_tgt_ht, pdc);
+
+		uet_pds_bm_free_pkts(pdc->tx_bm);
+		uet_pds_bm_free_pkts(pdc->rx_bm);
 
 		if (pdc->tx_bm)
 			bm_destroy(pdc->tx_bm);
@@ -2900,6 +2932,7 @@ static int uet_pds_tx_ack_pkt(struct uet_instance *uet,
 		pdc_pkt->needs_clear = false;
 		pdc_pkt->ack_len = 0;
 		free(pdc_pkt->ack_buf);
+		pdc_pkt->ack_buf = NULL; /* or the window frees it again */
 		return rc;
 	}
 
@@ -3003,6 +3036,7 @@ static int uet_pds_tx_close_ack_epsn(struct uet_instance *uet,
 	if (rc != 0) {
 		pdc_pkt->ack_len = 0;
 		free(pdc_pkt->ack_buf);
+		pdc_pkt->ack_buf = NULL;
 		return rc;
 	}
 
@@ -4033,6 +4067,8 @@ static int uet_pds_process_close_req_cp(struct uet_instance *uet,
 	memset(&temp_pkt, 0, sizeof(temp_pkt));
 	memcpy(&temp_pkt.pkt_pp, pp, sizeof(*pp));
 	uet_pds_tx_ack_pkt(uet, pdc, &temp_pkt, UET_HDR_NONE, 0, NULL, false);
+	/* the ACK is not kept for a resend: nothing tracks temp_pkt */
+	free(temp_pkt.ack_buf);
 	uet_pds_initiate_pdc_close(uet, pdc);
 
 	return 0;
@@ -4107,6 +4143,9 @@ static int uet_pds_process_close_command_cp(struct uet_instance *uet,
 		return rc;
 	}
 
+	/* the closing ACK is not kept: the PDC goes now. On a failed send
+	 * the builders have freed it themselves. */
+	free(temp_pkt.ack_buf);
 	uet_pdsm_free_pdc(pdc);
 
 	return 0;
