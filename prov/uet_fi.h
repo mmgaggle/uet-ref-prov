@@ -64,6 +64,17 @@
 			   FI_TRANSMIT_COMPLETE | FI_DELIVERY_COMPLETE)
 
 /*
+ * fi_getopt(&ep->fid, FI_OPT_ENDPOINT, FI_UET_OPT_CLOSE_DISCARDS, &b, &len)
+ * with bool b: whether fi_close() of the endpoint discards the writes it
+ * has outstanding, so none of them lands afterwards. False over a core that
+ * cannot take back what it has handed over: the reference core with
+ * UET_PDS=sng, or a rocm-ernic device older than ABI version 2 or with
+ * pds=sng. A consumer that relies on cutting writes off by closing the
+ * endpoint checks it up front. See README.md.
+ */
+#define FI_UET_OPT_CLOSE_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5545U))
+
+/*
  * Endpoint address, as returned by fi_getname() and accepted by
  * fi_av_insert(). It is self-contained and byte-order independent:
  *
@@ -163,6 +174,7 @@ struct uetfi_domain {
 	struct uetfi_ep *ep;		/* the domain's endpoint, if open */
 	struct uetfi_dlist mr_list;	/* struct uetfi_mr */
 	int refs;			/* av, cq, ep and mr objects */
+	int abandoned;			/* core endpoints that would not close */
 	pthread_mutex_t lock;		/* see "Threads" above */
 };
 

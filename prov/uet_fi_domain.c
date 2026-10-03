@@ -535,6 +535,15 @@ static int uetfi_av_close(struct fid *fid)
 	}
 	while ((peer = av->peers)) {
 		ret = uet_av_remove(peer->h);
+		if (ret && dom->abandoned) {
+			/*
+			 * An abandoned endpoint still counts an operation to
+			 * this peer. The core's entry stays, and with it the
+			 * address it points to.
+			 */
+			av->peers = peer->next;
+			continue;
+		}
 		if (ret) {
 			uetfi_unlock(dom);
 			return ret;
@@ -641,12 +650,24 @@ static int uetfi_domain_close(struct fid *fid)
 
 	if (dom->refs)
 		return -FI_EBUSY;
-	ret = uet_domain_close(dom->h);
-	if (ret)
-		return ret;
+	if (dom->abandoned) {
+		/*
+		 * An endpoint the core would not close is still in its
+		 * domain, so the core's domain cannot close, and its instance
+		 * cannot go either: both are left, and the libfabric domain
+		 * goes. The core keeps them for the life of the process.
+		 */
+		UETFI_WARN(FI_LOG_DOMAIN, "keeping the core domain: %d "
+			   "endpoint(s) in it would not close\n",
+			   dom->abandoned);
+	} else {
+		ret = uet_domain_close(dom->h);
+		if (ret)
+			return ret;
+		uetfi_core_put();
+	}
 	pthread_mutex_destroy(&dom->lock);
 	fi_freeinfo(dom->core_info);
-	uetfi_core_put();
 	dom->fabric->refs--;
 	free(dom);
 	return 0;

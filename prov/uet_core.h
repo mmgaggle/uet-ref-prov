@@ -32,6 +32,14 @@
 #define UET_MR_KEY_NONE			((uint64_t) 0)
 #define UET_MR_KEY_IDEMPOTENT_SAFE	0x8000000000000000ULL
 
+/* endpoint options (FI_OPT_ENDPOINT); older libfabric headers lack the
+ * provider-specific range */
+#ifndef FI_PROV_SPECIFIC
+#define FI_PROV_SPECIFIC (1U << 31)
+#endif
+#define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
+#define UET_OPT_ABORT ((int)(FI_PROV_SPECIFIC | 2U))
+
 typedef void *uet_handle_t;
 typedef void *uet_domain_handle_t;
 typedef void *uet_ep_handle_t;
@@ -72,6 +80,8 @@ int uet_ep_bind_cq(uet_ep_handle_t ep_handle, struct fi_cq_attr *attr,
 		   struct fid_cq *cq, uint64_t flags, void *context,
 		   uet_cq_handle_t *cq_handle);
 int uet_ep_enable(uet_ep_handle_t ep_handle);
+int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
+		  void *optval, size_t *optlen);
 int uet_ep_abort(uet_ep_handle_t ep_handle);
 int uet_ep_close(uet_ep_handle_t ep_handle);
 int uet_ep_progress(uet_ep_handle_t ep_handle);

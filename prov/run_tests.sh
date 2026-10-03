@@ -152,7 +152,7 @@ cutoff() {
 		> "$TMP/w2.log" 2>&1 || rc=1
 	wait $wpid || rc=1
 	wait $tpid || rc=1
-	grep -a -h "^CUTOFF\|^REOPENED\|^REWROTE\|^NEW WINDOW\|^SNAPSHOT\|^VERIFIED\|^WROTE\|^TIMEOUT\|^FAILED\|^MISMATCH\|^completion error" \
+	grep -a -h "^DISCARDS\|^CUTOFF\|^REOPENED\|^REWROTE\|^NEW WINDOW\|^SNAPSHOT\|^VERIFIED\|^WROTE\|^TIMEOUT\|^FAILED\|^MISMATCH\|^completion error" \
 		"$TMP"/w1.log "$TMP"/target.log "$TMP"/w2.log | sed 's/^/      /'
 	grep -q "^SNAPSHOT 0 of" "$TMP/target.log" || rc=1
 	rm -f "$TMP"/w*.log

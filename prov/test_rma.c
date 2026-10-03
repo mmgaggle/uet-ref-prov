@@ -80,6 +80,25 @@
 
 #define MAX_ADDR 64
 
+/* the provider's option, as a consumer that does not include its headers
+ * defines it (see README.md) */
+#ifndef FI_PROV_SPECIFIC
+#define FI_PROV_SPECIFIC (1U << 31)
+#endif
+#define FI_UET_OPT_CLOSE_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5545U))
+
+/* whether fi_close() of the endpoint discards its writes */
+static bool close_discards(struct fid_ep *ep)
+{
+	bool b = false;
+	size_t len = sizeof(b);
+
+	if (fi_getopt(&ep->fid, FI_OPT_ENDPOINT, FI_UET_OPT_CLOSE_DISCARDS, &b,
+		      &len))
+		return false;
+	return b;
+}
+
 struct opts {
 	const char *ifname;
 	const char *outfile;
@@ -928,6 +947,7 @@ static int run_cutoff(const struct opts *o, const char *addr_hex,
 	fi_addr_t peer;
 	double t0, tc0, tc1, deadline;
 	int ret, signals = 0;
+	bool discards;
 	FILE *f;
 
 	if (unhex(addr_hex, peer_addr, sizeof(peer_addr), &peer_len))
@@ -936,6 +956,10 @@ static int run_cutoff(const struct opts *o, const char *addr_hex,
 
 	memset(&r, 0, sizeof(r));
 	CHECK(setup(&r, o, FI_CQ_FORMAT_DATA));
+	discards = close_discards(r.ep);
+	printf("DISCARDS %s: fi_close() %s outstanding writes\n",
+	       discards ? "yes" : "no",
+	       discards ? "discards" : "cannot guarantee to discard");
 	src = malloc(len);
 	zero = calloc(1, 4096);
 	win = aligned_alloc(4096, (len + 4095) & ~(size_t) 4095);
@@ -963,13 +987,18 @@ static int run_cutoff(const struct opts *o, const char *addr_hex,
 		return 1;
 	}
 	tc0 = now();
-	CHECK(fi_close(&r.ep->fid));
+	ret = fi_close(&r.ep->fid);
 	tc1 = now();
+	/* the endpoint is gone either way; -FI_EIO only where it said so */
+	if (ret && !(ret == -FI_EIO && !discards)) {
+		printf("FAILED fi_close(ep): %s\n", fi_strerror(-ret));
+		return 1;
+	}
 	CHECK(fi_close(&r.cq->fid));
 	r.ep = NULL;
 	r.cq = NULL;
-	printf("CUTOFF after %.2f s, fi_close(ep) took %.3f ms\n", tc0 - t0,
-	       (tc1 - tc0) * 1000);
+	printf("CUTOFF after %.2f s, fi_close(ep) took %.3f ms, returned %s\n",
+	       tc0 - t0, (tc1 - tc0) * 1000, ret ? fi_strerror(-ret) : "0");
 	fflush(stdout);
 
 	/* carry on with a new endpoint on the same domain and AV */

@@ -53,9 +53,12 @@ What differs from the reference core:
   one of the guest's.
 * `cq_data_size` is 0, and `fi_writedata()` returns `-FI_ENOSYS`: the
   engine raises no events at the target. A target checks its window.
-* `fi_close()` cannot discard writes already handed to the device
-  (`uet_ep_abort()` returns `-FI_ENOSYS`), so it drops the queued ones
-  and waits up to 10 s for the rest, as with `UET_PDS=sng`.
+* `fi_close()` discards the writes it has handed to the device: the
+  library sends the device an `ABORT` for the endpoint's transfers (ABI
+  version 2). A device that cannot (older, or running `pds=sng`) reports
+  `FI_UET_OPT_CLOSE_DISCARDS` false; closing an endpoint with writes in
+  flight then destroys the instance's service QP, which leaves the domain
+  unusable, and `fi_close()` returns `-FI_EIO` (see below).
 * Writes go in segments of 1 MiB, 4 in flight: each segment is a
   command to the device, and the device paces RUDI itself.
 * `FI_UET_TX_TIMEOUT` and `FI_UET_TX_RETRIES` do not apply; the
@@ -178,9 +181,31 @@ atomic and collective operations return `-FI_ENOSYS`.
   open a new endpoint on the domain at once; it gets the same address,
   and registered regions are bound to it. A RUD PDC that loses packets
   this way is closed with the peer by a CLOSE control packet, which
-  carries no data, or freed if it was never established. (With
-  `UET_PDS=sng`, which cannot discard, the close waits up to 10 s for
-  writes in flight instead.)
+  carries no data, or freed if it was never established.
+* `fi_close()` always releases the endpoint. It returns 0 when the
+  writes were discarded, or there were none in flight, and `-FI_EIO`
+  when the discard is not guaranteed: the core could not take its
+  segments back, so the endpoint was torn down hard instead. With
+  `UET_PDS=sng` the core endpoint is abandoned: nothing drives it any
+  more, so the packet it has on the wire is the last, its regions are
+  disabled, and the core keeps its memory, and its domain, for the
+  life of the process. Over a rocm-ernic device the library destroys its
+  service QP, which makes the device drop what it can and answer none of
+  it, and the domain is then unusable: close it and open another.
+* A consumer that relies on cutting writes off by closing the endpoint
+  checks first whether it can, with the provider-specific endpoint
+  option `FI_UET_OPT_CLOSE_DISCARDS`, `FI_PROV_SPECIFIC | 0x5545`
+  (read only, `bool`):
+
+  ```c
+  bool can = false;
+  size_t len = sizeof(can);
+  fi_getopt(&ep->fid, FI_OPT_ENDPOINT, FI_PROV_SPECIFIC | 0x5545, &can,
+            &len);
+  ```
+
+  It is false over `UET_PDS=sng`, and over a rocm-ernic device older
+  than ABI version 2 or running `pds=sng`.
 * Errors are reported through `fi_cq_readerr`. Transport errors such as
   an unknown key, an out-of-range offset or exhausted retries all
   arrive as `FI_EIO`, because the core does not pass the SES return

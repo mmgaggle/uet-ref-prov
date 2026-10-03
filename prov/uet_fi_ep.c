@@ -23,7 +23,10 @@
  *
  * fi_close() discards what is outstanding, without completions: queued
  * segments are dropped here and uet_ep_abort() drops those in flight,
- * so nothing of them is sent again once the close has started.
+ * so nothing of them is sent again once the close has started. fi_close()
+ * always releases the endpoint. It returns -FI_EIO when it could not
+ * guarantee the discard: the core could not take its segments back and
+ * the endpoint was torn down hard instead (see uetfi_ep_close()).
  */
 
 #include <stdlib.h>
@@ -32,8 +35,6 @@
 
 #include "uet_fi.h"
 
-/* waiting for writes at close, only if the PDS cannot discard them */
-#define UETFI_CLOSE_DRAIN_SECS 10
 
 static struct fi_ops_msg uetfi_msg_nosys;
 static struct fi_ops_tagged uetfi_tagged_nosys;
@@ -426,13 +427,35 @@ static int uetfi_ep_enable(struct uetfi_ep *ep)
 	return 0;
 }
 
+/*
+ * A core endpoint that would not close: it still has segments it cannot
+ * take back (UET_PDS=sng). It is left as it is, and nothing drives it any
+ * more: the stop-and-go PDS retransmits only from the endpoint's own
+ * progress, so the packet it has on the wire is the last. Its regions are
+ * disabled, so peers stop reaching them and they can be bound again. The
+ * core keeps its memory, and the domain keeps the core's domain and
+ * instance when it closes (see uetfi_domain_close()).
+ */
+static void uetfi_ep_abandon(struct uetfi_ep *ep)
+{
+	struct uetfi_dlist *it;
+	struct uetfi_mr *mr;
+
+	uetfi_dlist_foreach(&ep->dom->mr_list, it) {
+		mr = container_of(it, struct uetfi_mr, entry);
+		if (mr->ep == ep && mr->enabled)
+			(void) uet_mr_disable(mr->h);
+	}
+	ep->dom->abandoned++;
+}
+
 static int uetfi_ep_close(struct fid *fid)
 {
 	struct uetfi_ep *ep = container_of(fid, struct uetfi_ep, ep_fid.fid);
 	struct uetfi_domain *dom = ep->dom;
 	struct timespec t0, t1;
 	size_t segs = ep->segs_inflight, ops = ep->ops_outstanding;
-	time_t deadline;
+	bool discarded = true;
 	int ret;
 
 	clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -443,20 +466,22 @@ static int uetfi_ep_close(struct fid *fid)
 	 * to the core go with the endpoint's memory, and the core drops the
 	 * segments in flight: from here on none of them is sent or
 	 * retransmitted. The core endpoint then closes at once.
+	 *
+	 * A core that cannot take its segments back (-FI_ENOSYS), or fails
+	 * to, is torn down hard instead: libuet_ernic destroys its service
+	 * QP, which makes the device drop the transfers it can and answer
+	 * none of them; the reference core's endpoint is abandoned below.
+	 * The endpoint is released either way, and -FI_EIO says the discard
+	 * is not guaranteed. With nothing in flight there is nothing to
+	 * discard, whatever the core can do.
 	 */
 	ep->pend_head = ep->pend_tail = NULL;
 	ret = uet_ep_abort(ep->h);
-	if (ret == -FI_ENOSYS && ep->enabled) {
-		/* a PDS that cannot abort (UET_PDS=sng): let them finish */
-		UETFI_WARN(FI_LOG_EP_CTRL, "the PDS cannot discard writes; "
-			   "waiting for those in flight\n");
-		deadline = time(NULL) + UETFI_CLOSE_DRAIN_SECS;
-		while (ep->segs_inflight && time(NULL) < deadline) {
-			uetfi_ep_progress(ep);
-			uetfi_ep_drain_rx(ep);
-		}
-	} else if (ret && ret != -FI_ENOSYS) {
-		return ret;
+	if (ret && segs) {
+		UETFI_WARN(FI_LOG_EP_CTRL, "cannot discard %zu segments in "
+			   "flight (%s); tearing the endpoint down\n", segs,
+			   fi_strerror(-ret));
+		discarded = false;
 	}
 
 	/*
@@ -468,14 +493,19 @@ static int uetfi_ep_close(struct fid *fid)
 		uetfi_mr_enable_bound(ep);
 
 	ret = uet_ep_close(ep->h);
-	if (ret)
-		return ret;
+	if (ret) {
+		UETFI_WARN(FI_LOG_EP_CTRL, "the core endpoint would not close "
+			   "(%s); abandoning it\n", fi_strerror(-ret));
+		uetfi_ep_abandon(ep);
+		discarded = false;
+	}
 
 	clock_gettime(CLOCK_MONOTONIC, &t1);
-	UETFI_INFO(FI_LOG_EP_CTRL, "endpoint closed in %ld us, discarding "
+	UETFI_INFO(FI_LOG_EP_CTRL, "endpoint closed in %ld us, %s "
 		   "%zu writes (%zu segments in flight)\n",
 		   (long) ((t1.tv_sec - t0.tv_sec) * 1000000 +
-			   (t1.tv_nsec - t0.tv_nsec) / 1000), ops, segs);
+			   (t1.tv_nsec - t0.tv_nsec) / 1000),
+		   discarded ? "discarding" : "could not discard", ops, segs);
 
 	uetfi_mr_detach_ep(ep);
 	if (ep->tx_cq)
@@ -492,7 +522,7 @@ static int uetfi_ep_close(struct fid *fid)
 	free(ep->comp);
 	free(ep->errs);
 	free(ep);
-	return 0;
+	return discarded ? 0 : -FI_EIO;
 }
 
 static int uetfi_ep_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
@@ -582,12 +612,29 @@ static int uetfi_ep_control(struct fid *fid, int command, void *arg)
 static int uetfi_ep_getopt(fid_t fid, int level, int optname, void *optval,
 			   size_t *optlen)
 {
-	(void) fid;
-	(void) level;
-	(void) optname;
-	(void) optval;
-	(void) optlen;
-	return -FI_ENOPROTOOPT;
+	struct uetfi_ep *ep = container_of(fid, struct uetfi_ep, ep_fid.fid);
+	size_t len = sizeof(bool);
+	bool can = false;
+	int ret;
+
+	if (level != FI_OPT_ENDPOINT || optname != FI_UET_OPT_CLOSE_DISCARDS)
+		return -FI_ENOPROTOOPT;
+	if (!optlen)
+		return -FI_EINVAL;
+	if (!optval || *optlen < sizeof(bool)) {
+		*optlen = sizeof(bool);
+		return -FI_ETOOSMALL;
+	}
+	uetfi_lock(ep->dom);
+	ret = uet_ep_getopt(ep->h, FI_OPT_ENDPOINT, UET_OPT_ABORT, &can, &len);
+	uetfi_unlock(ep->dom);
+	if (ret == -FI_ENOSYS)
+		can = false;	/* a core that does not know the option */
+	else if (ret)
+		return ret;
+	*(bool *) optval = can;
+	*optlen = sizeof(bool);
+	return 0;
 }
 
 static int uetfi_ep_setopt(fid_t fid, int level, int optname,
