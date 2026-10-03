@@ -128,6 +128,9 @@ struct uet_pdc_pkt {
 	bool                  pkt_parsed;
 	struct uet_parsed_pkt ack_pp;
 	bool                  ack_parsed;
+	bool                  has_ref; /* payload left in the message's buffer */
+	struct uet_payload_ref ref;
+	uint32_t              crc;     /* trailer of a has_ref packet, as sent */
 };
 
 /* The PDC key used for hash table lookups. */
@@ -402,6 +405,15 @@ char uet_pdc_rx_bit_char(void *data)
 /* forward decl: called by uet_pds_progress_tx_pkt() before its definition */
 static void uet_pds_close_pdc_in_error(struct uet_instance *uet,
 				       struct uet_pdc *pdc);
+
+/* uet_pds_tx_pkt() and uet_pds_tx_pkt_ref() share this */
+static int pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
+		      struct uet_ep *uet_ep, uet_addr_handle_t dst_addr_handle,
+		      uet_pds_mode_t mode, uet_pds_tx_flags_t flags,
+		      struct uet_pds_info *pds_info, uint16_t msg_id,
+		      uet_pds_next_hdr_t next_hdr, void *ses, size_t ses_len,
+		      void *pkt, size_t pkt_len, bool dma_rdy,
+		      const struct uet_payload_ref *ref);
 
 /****************************************************************************/
 /*                       Security and NIC Shim APIs                         */
@@ -1823,6 +1835,27 @@ int uet_pds_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
 		       size_t ses_len,
 		       const struct uet_payload_ref *ref)
 {
+	if (mode == UET_PDS_MODE_RUD) {
+		struct uet_instance *uet = uet_ep->uet_domain->uet;
+
+		/*
+		 * A RUD request's payload stays in the message's buffer as
+		 * well, when the NIC shim sends frames in pieces and no
+		 * security header has to cover it.
+		 */
+		static int sec_mode = -1;
+
+		if (sec_mode < 0)
+			sec_mode = (getenv(UET_SEC_MODE) != NULL);
+		if (!uet->tx_payload_iov || pds_info || (ref == NULL) ||
+		    (ref->len == 0) || imp_shim_is_enabled() || sec_mode)
+			return -ENOTSUP;
+		return pds_tx_pkt(tx_pkt_handle, pkt_cnt, uet_ep,
+				  dst_addr_handle, mode, flags, pds_info,
+				  msg_id, next_hdr, ses, ses_len, NULL,
+				  ref->len, false, ref);
+	}
+
 	if (mode != UET_PDS_MODE_RUDI)
 		return -ENOTSUP;
 
@@ -1830,6 +1863,94 @@ int uet_pds_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
 				       dst_addr_handle, mode, flags,
 				       pds_info, msg_id, next_hdr, ses,
 				       ses_len, ref);
+}
+
+/* pieces of a packet sent with its payload in place: headers, payload, CRC */
+#define UET_PDS_REF_MAX_IOV 16
+
+/*
+ * Send a packet whose payload is still in the message's buffer: the
+ * headers from pkt_buf, the payload where it is, and the CRC, as pieces.
+ * The CRC covers the PDS header, which a retransmission changes, so it is
+ * computed on every send.  The payload is resolved again on every send,
+ * so a region taken away meanwhile fails the send instead of sending
+ * whatever its memory holds now.  No security header: the dispatcher
+ * made sure of that.
+ */
+static int uet_pds_tx_ref_send(struct uet_instance *uet,
+			       struct uet_pdc_pkt *pdc_pkt)
+{
+	struct iovec iov[UET_PDS_REF_MAX_IOV];
+	size_t hdr_len = ((size_t)pdc_pkt->pkt_len - pdc_pkt->ref.len);
+	size_t len = ((size_t)pdc_pkt->pkt_len + CRC_LEN);
+	uint8_t *crc_start, *f;
+	uint32_t crc;
+	int n, i, rc;
+
+	if (!pdc_pkt->pkt_parsed) {
+		rc = uet_parse_pkt(uet, pdc_pkt->pkt, pdc_pkt->pkt_len,
+				   &pdc_pkt->pkt_pp);
+		if (rc != 0) {
+			UET_PDS_ERR("malformed Tx packet");
+			return rc;
+		}
+		pdc_pkt->pkt_parsed = true;
+	}
+	crc_start = (pdc_pkt->pkt_pp.is_ipv6) ?
+		    ((uint8_t *)pdc_pkt->pkt_pp.ip + 8) :
+		    ((uint8_t *)pdc_pkt->pkt_pp.ip + 12);
+	crc = crc32c_update(crc32c_init(), crc_start,
+			    (uint32_t)(pdc_pkt->pkt + hdr_len - crc_start));
+
+	/* randomly drop packets for testing retransmit logic */
+	if (pds_pkt_drop_thresh &&
+	    uet_pds_random_check(pds_pkt_drop_thresh)) {
+		UET_PDS_ERR("PDC PSN %u random drop Tx packet!",
+			    pdc_pkt->pkt_pp.pds_psn);
+		uet_gettime(&pdc_pkt->tx_time);
+		return 0;
+	}
+
+	n = uet_payload_iov(&pdc_pkt->ref, iov + 1, UET_PDS_REF_MAX_IOV - 2);
+	if (n == -EFAULT)
+		return n; /* the region went away */
+	if (n > 0) {
+		for (i = 1; i <= n; i++)
+			crc = crc32c_update(crc, iov[i].iov_base,
+					    (uint32_t)iov[i].iov_len);
+		pdc_pkt->crc = crc32c_finish(crc);
+		iov[0].iov_base = pdc_pkt->pkt;
+		iov[0].iov_len = hdr_len;
+		iov[n + 1].iov_base = &pdc_pkt->crc;
+		iov[n + 1].iov_len = CRC_LEN;
+		rc = uet_nic_tx_pkt_iov(UET_NIC(uet), iov, n + 2, len);
+		if (rc != -ENOTSUP)
+			goto sent;
+	} else if ((n != -E2BIG) && (n != -ENOTSUP) && (n != 0)) {
+		return n;
+	}
+
+	/* one flat frame instead */
+	f = malloc(len);
+	if (f == NULL)
+		return -ENOMEM;
+	memcpy(f, pdc_pkt->pkt, hdr_len);
+	if (uet_payload_copy(&pdc_pkt->ref, f + hdr_len) != pdc_pkt->ref.len) {
+		free(f);
+		return -EFAULT;
+	}
+	if (n <= 0) {
+		crc = crc32c_update(crc, f + hdr_len,
+				    (uint32_t)pdc_pkt->ref.len);
+		pdc_pkt->crc = crc32c_finish(crc);
+	}
+	memcpy(f + pdc_pkt->pkt_len, &pdc_pkt->crc, CRC_LEN);
+	rc = uet_nic_tx_pkt(UET_NIC(uet), f, f + sizeof(struct ethhdr), len);
+	free(f);
+sent:
+	if (rc == 0)
+		uet_gettime(&pdc_pkt->tx_time);
+	return rc;
 }
 
 int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
@@ -1846,6 +1967,19 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 		   void *pkt,
 		   size_t pkt_len,
 		   bool dma_rdy)
+{
+	return pds_tx_pkt(tx_pkt_handle, pkt_cnt, uet_ep, dst_addr_handle,
+			  mode, flags, pds_info, msg_id, next_hdr, ses,
+			  ses_len, pkt, pkt_len, dma_rdy, NULL);
+}
+
+static int pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle, uint64_t pkt_cnt,
+		      struct uet_ep *uet_ep, uet_addr_handle_t dst_addr_handle,
+		      uet_pds_mode_t mode, uet_pds_tx_flags_t flags,
+		      struct uet_pds_info *pds_info, uint16_t msg_id,
+		      uet_pds_next_hdr_t next_hdr, void *ses, size_t ses_len,
+		      void *pkt, size_t pkt_len, bool dma_rdy,
+		      const struct uet_payload_ref *ref)
 {
 	struct uet_instance *uet;
 	struct uet_av_entry *av_entry;
@@ -2006,14 +2140,29 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	 * - add support for gather iov send
 	 */
 
+	/* a payload sent in place has no security header to cover it */
+	if ((ref != NULL) && pdc->sec_enabled)
+		return -ENOTSUP;
+
 	pdc_pkt = calloc(1, sizeof(struct uet_pdc_pkt));
 	if (pdc_pkt == NULL) {
 		UET_PDS_ERR("failed to alloc PDC packet");
 		return -ENOMEM;
 	}
 
-	pdc_pkt->pkt_buf_len = (uet->nic.max_pkt_size *
-				((pdc->sec_enabled) ? 2 : 1));
+	if (ref != NULL) {
+		/* the headers and the CRC: the payload is sent from where
+		 * it is (uet_pds_tx_ref_send()) */
+		pdc_pkt->pkt_buf_len =
+			(int)(sizeof(struct ethhdr) +
+			      ((pdc->is_ipv6) ? sizeof(struct ipv6hdr) :
+						sizeof(struct iphdr)) +
+			      uet_encap_len(uet) + sizeof(struct uet_pds_req) +
+			      ses_len + CRC_LEN);
+	} else {
+		pdc_pkt->pkt_buf_len = (uet->nic.max_pkt_size *
+					((pdc->sec_enabled) ? 2 : 1));
+	}
 	pdc_pkt->pkt_buf = calloc(1, pdc_pkt->pkt_buf_len);
 	if (pdc_pkt->pkt_buf == NULL) {
 		UET_PDS_ERR("failed to alloc packet buffer");
@@ -2097,7 +2246,12 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	/* TODO: support for gather iov send */
 
 	memcpy(ses_hdr, ses, ses_len);
-	memcpy(payload, pkt, pkt_len);
+	if (ref != NULL) {
+		pdc_pkt->has_ref = true;
+		pdc_pkt->ref = *ref;
+	} else {
+		memcpy(payload, pkt, pkt_len);
+	}
 
 	/* build the IP header */
 	if (pdc->is_ipv6) {
@@ -2154,7 +2308,9 @@ int uet_pds_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	}
 
 	/* send the packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, false);
+	rc = (pdc_pkt->has_ref) ?
+	     uet_pds_tx_ref_send(uet, pdc_pkt) :
+	     uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, false);
 	if (rc != 0) {
 		bm_unset(pdc->tx_bm, tx_bm_idx);
 		if (mapped_msg_id) {
@@ -2269,7 +2425,9 @@ static int uet_pds_rtx_pkt(struct uet_instance *uet,
 	pdc_pkt->pkt_pp.pds_flags |= UET_PDS_REQ_FLAGS_RETX;
 
 	/* retransmit the packet */
-	rc = uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, true);
+	rc = (pdc_pkt->has_ref) ?
+	     uet_pds_tx_ref_send(uet, pdc_pkt) :
+	     uet_pds_sec_tx_pkt(uet, pdc, pdc_pkt, true, true);
 	if (rc != 0)
 		return rc;
 

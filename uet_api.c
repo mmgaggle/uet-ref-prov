@@ -5656,13 +5656,14 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 		}
 
 		/*
-		 * With a NIC shim that transmits frames in pieces, a RUDI
-		 * request's payload stays where it is: no copy into a packet
-		 * here or in the PDS, and none for a retransmission.
+		 * With a NIC shim that transmits frames in pieces, a RUDI or
+		 * RUD request's payload stays where it is: no copy into a
+		 * packet here or in the PDS, and none for a retransmission.
 		 */
 		if (uet_ep->uet_domain->uet->tx_payload_iov &&
 		    (pds->downcall.tx_pkt_ref != NULL) &&
-		    (tx_desc->pds_mode == UET_PDS_MODE_RUDI) &&
+		    ((tx_desc->pds_mode == UET_PDS_MODE_RUDI) ||
+		     (tx_desc->pds_mode == UET_PDS_MODE_RUD)) &&
 		    (pkt_len != 0) && (ses_len == sizeof(struct uet_ses_req_std)) &&
 		    ((tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_SEG) ||
 		     (tx_desc->buf_desc.type == UET_MSG_BUF_TYPE_CONTIG))) {
