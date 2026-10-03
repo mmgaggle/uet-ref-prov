@@ -40,6 +40,18 @@
  *	meanwhile, none slower than 200 ms. Then a write to the dead peer
  *	must fail at once, and the target is signalled
  *
+ *   test_rma [opts] avrace <addr-hex> <key-hex> <base> <len> <dead-addr-hex>
+ *	fi_av_insert racing other calls, FI_THREAD_SAFE with FI_AV_MAP:
+ *	two threads insert the peer that never answers ARP (dead-addr-hex)
+ *	at once, and must get the same fi_addr. Then, while a thread inserts
+ *	another such peer (the address one lower), the main thread posts
+ *	writes of the pattern to the target window, closes the endpoint with
+ *	them in flight, and opens a new one on the same domain and AV, none
+ *	of which may wait for the insert; the new endpoint writes [0, len)
+ *	and signals the target. Then writes to the dead peer for a second
+ *	must each fail at once, and inserting the subnet's broadcast address
+ *	must not wait for ARP
+ *
  * options:
  *   -i ifname   netdev (hints->domain_attr->name; default: $UET_IFNAME)
  *   -o file     target: also write "addr key base size" to file
@@ -172,6 +184,8 @@ static int unhex(const char *s, uint8_t *b, size_t max, size_t *n)
 }
 
 static int open_ep(struct res *r, enum fi_cq_format format);
+static int poll_tx(struct res *r, size_t want, double deadline,
+		   int *signals);
 
 static int setup(struct res *r, const struct opts *o,
 		 enum fi_cq_format format)
@@ -731,6 +745,214 @@ static int run_mt(const struct opts *o, const char *addr_hex,
 	return rc ? rc : ret;
 }
 
+struct av_ins {
+	struct res *r;
+	const uint8_t *addr;
+	pthread_barrier_t *go;
+	fi_addr_t fa;
+	int ret;
+	double t0, t1;
+};
+
+static void *av_insert_thread(void *arg)
+{
+	struct av_ins *a = arg;
+
+	if (a->go)
+		pthread_barrier_wait(a->go);
+	a->t0 = now();
+	a->ret = fi_av_insert(a->r->av, a->addr, 1, &a->fa, 0, NULL);
+	a->t1 = now();
+	return NULL;
+}
+
+/* write and wait for the outcome: 0, or the error of the post or of its
+ * completion */
+static int write_outcome(struct res *r, const void *buf, size_t len,
+			 fi_addr_t peer, uint64_t addr, uint64_t key)
+{
+	struct fi_cq_err_entry err;
+	struct fi_context2 ctx;
+	double t0 = now();
+	ssize_t n;
+	int ret;
+
+	ret = fi_write(r->ep, buf, len, NULL, peer, addr, key, &ctx);
+	if (ret)
+		return ret;
+	while ((n = fi_cq_read(r->cq, &err, 1)) == -FI_EAGAIN &&
+	       now() - t0 < 5)
+		;
+	if (n == 1)
+		return 0;
+	if (n != -FI_EAVAIL)
+		return n == -FI_EAGAIN ? -FI_ETIMEDOUT : (int) n;
+	memset(&err, 0, sizeof(err));
+	if (fi_cq_readerr(r->cq, &err, 0) != 1)
+		return -FI_EIO;
+	return -err.err;
+}
+
+/* the address with another last IPv4 byte (bytes 16-19 are the IPv4
+ * address, in network order) */
+static void addr_with_host(uint8_t *out, const uint8_t *in, uint8_t host)
+{
+	memcpy(out, in, MAX_ADDR);
+	out[19] = host;
+}
+
+static int run_avrace(const struct opts *o, const char *addr_hex,
+		      const char *key_hex, uint64_t base, size_t len,
+		      const char *dead_hex)
+{
+	struct opts mo = *o;
+	struct res r;
+	struct av_ins ins[2];
+	struct fi_context2 ctx[64];
+	uint8_t peer_addr[MAX_ADDR], dead_addr[MAX_ADDR], dead2[MAX_ADDR],
+		bcast[MAX_ADDR];
+	size_t peer_len, dead_len, i, posted, depth, n_dead = 0, off, clen;
+	pthread_barrier_t go;
+	pthread_t thr[2];
+	fi_addr_t peer, bfa;
+	uint64_t key = strtoull(key_hex, NULL, 16);
+	double overlap, tc0, tc1, t0, tb0, tb1;
+	uint8_t *buf;
+	int ret, last = 0, rc = 0, signals = 0;
+	bool discards;
+
+	if (unhex(addr_hex, peer_addr, sizeof(peer_addr), &peer_len) ||
+	    unhex(dead_hex, dead_addr, sizeof(dead_addr), &dead_len) ||
+	    dead_len < 20) {
+		fprintf(stderr, "bad address\n");
+		return 2;
+	}
+	addr_with_host(dead2, dead_addr, dead_addr[19] - 1);
+	addr_with_host(bcast, dead_addr, 0xff);
+	memset(&r, 0, sizeof(r));
+	mo.thread_safe = true;
+	mo.av_map = true;
+	CHECK(setup(&r, &mo, FI_CQ_FORMAT_DATA));
+	if (r.info->domain_attr->threading != FI_THREAD_SAFE) {
+		fprintf(stderr, "the provider is not FI_THREAD_SAFE\n");
+		return 1;
+	}
+	discards = close_discards(r.ep);
+	buf = aligned_alloc(4096, (len + 4095) & ~(size_t) 4095);
+	if (!buf)
+		return -FI_ENOMEM;
+	for (i = 0; i < len; i++)
+		buf[i] = pattern(i);
+	if (fi_av_insert(r.av, peer_addr, 1, &peer, 0, NULL) != 1)
+		return 1;
+
+	/* two inserts of one new peer at once share one entry */
+	pthread_barrier_init(&go, NULL, 2);
+	for (i = 0; i < 2; i++) {
+		ins[i] = (struct av_ins){ .r = &r, .addr = dead_addr,
+					  .go = &go };
+		if (pthread_create(&thr[i], NULL, av_insert_thread, &ins[i]))
+			return 1;
+	}
+	for (i = 0; i < 2; i++)
+		pthread_join(thr[i], NULL);
+	pthread_barrier_destroy(&go);
+	overlap = (ins[0].t1 < ins[1].t1 ? ins[0].t1 : ins[1].t1) -
+		  (ins[0].t0 > ins[1].t0 ? ins[0].t0 : ins[1].t0);
+	printf("DEDUP two inserts of one unanswering peer at once: %.3f s and "
+	       "%.3f s, overlapping %.3f s, fi_addr %s\n",
+	       ins[0].t1 - ins[0].t0, ins[1].t1 - ins[1].t0, overlap,
+	       ins[0].fa == ins[1].fa ? "equal" : "DIFFERENT");
+	if (ins[0].ret != 1 || ins[1].ret != 1 || ins[0].fa != ins[1].fa ||
+	    overlap < 0.3)
+		rc = 1;
+	/* one reference each; the entry stays until both are removed */
+	CHECK(fi_av_remove(r.av, &ins[1].fa, 1, 0));
+
+	/* an endpoint cut off while another peer is being inserted */
+	ins[1] = (struct av_ins){ .r = &r, .addr = dead2 };
+	if (pthread_create(&thr[1], NULL, av_insert_thread, &ins[1]))
+		return 1;
+	usleep(200000);		/* the insert waits for ARP now */
+	depth = o->depth < 64 ? o->depth : 64;
+	for (posted = 0, off = 0; posted < depth && off < len;
+	     posted++, off += clen) {
+		clen = len - off < o->chunk ? len - off : o->chunk;
+		while ((ret = fi_write(r.ep, buf + off, clen, NULL, peer,
+				       base + off, key, &ctx[posted])) ==
+		       -FI_EAGAIN)
+			(void) fi_cq_read(r.cq, NULL, 0);
+		CHECK(ret);
+	}
+	tc0 = now();
+	ret = fi_close(&r.ep->fid);
+	if (ret && !(ret == -FI_EIO && !discards)) {
+		printf("FAILED fi_close(ep): %s\n", fi_strerror(-ret));
+		return 1;
+	}
+	CHECK(fi_close(&r.cq->fid));
+	r.ep = NULL;
+	r.cq = NULL;
+	CHECK(open_ep(&r, FI_CQ_FORMAT_DATA));
+	tc1 = now();
+	pthread_join(thr[1], NULL);
+	printf("AVCUT %zu writes in flight; fi_close(ep) returned %s, close "
+	       "and reopen took %.1f ms, %s the insert (%.3f s) returned\n",
+	       posted, ret ? fi_strerror(-ret) : "0", (tc1 - tc0) * 1e3,
+	       tc1 < ins[1].t1 ? "before" : "AFTER", ins[1].t1 - ins[1].t0);
+	if (ins[1].ret != 1 || tc1 >= ins[1].t1 || tc1 - tc0 > 0.2 ||
+	    ins[1].t1 - ins[1].t0 < 0.5)
+		rc = 1;
+
+	/* the new endpoint writes the window and signals the target */
+	t0 = now();
+	CHECK(fi_write(r.ep, buf, len, NULL, peer, base, key, &ctx[0]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	CHECK(fi_writedata(r.ep, NULL, 0, NULL, 0, peer, base, key, &ctx[1]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	printf("REWROTE %zu bytes with the new endpoint and signalled\n", len);
+
+	/* the dead peer: every write fails at once, and costs little */
+	t0 = now();
+	while (now() - t0 < 1.0) {
+		ret = write_outcome(&r, buf, 4096, ins[0].fa, base, key);
+		if (!ret || ret == -FI_EAGAIN || ret == -FI_ETIMEDOUT) {
+			printf("FAILED write %zu to the dead peer: %s, %.1f ms "
+			       "in\n", n_dead, ret ? fi_strerror(-ret) :
+			       "completed", (now() - t0) * 1e3);
+			return 1;
+		}
+		last = ret;
+		n_dead++;
+	}
+	printf("DEADPOSTS %zu writes to the unanswering peer failed in 1 s, "
+	       "%.2f us each, all %s\n", n_dead, 1e6 / (double) n_dead,
+	       fi_strerror(-last));
+
+	/* not a unicast route: no ARP, no wait */
+	tb0 = now();
+	ret = fi_av_insert(r.av, bcast, 1, &bfa, 0, NULL);
+	tb1 = now();
+	if (ret == 1) {
+		last = write_outcome(&r, buf, 4096, bfa, base, key);
+		CHECK(fi_av_remove(r.av, &bfa, 1, 0));
+	} else {
+		last = ret;
+	}
+	printf("BCAST insert of the broadcast address took %.1f ms, a write "
+	       "to it: %s\n", (tb1 - tb0) * 1e3,
+	       last ? fi_strerror(-last) : "COMPLETED");
+	if (!last || last == -FI_ETIMEDOUT || tb1 - tb0 > 0.3)
+		rc = 1;
+
+	CHECK(fi_av_remove(r.av, &ins[1].fa, 1, 0));
+	CHECK(fi_av_remove(r.av, &ins[0].fa, 1, 0));
+	CHECK(fi_av_remove(r.av, &peer, 1, 0));
+	free(buf);
+	ret = teardown(&r);
+	return rc ? rc : ret;
+}
+
 static int run_pair(const struct opts *o, size_t size, const char *peerfile)
 {
 	struct res r;
@@ -1084,6 +1306,8 @@ static void usage(void)
 		"<base> <len> <budget-ms> <dir>\n"
 		"       test_rma [-i ifname] [-c chunk] mt <addr-hex> "
 		"<key-hex> <base> <len> <dead-addr-hex>\n"
+		"       test_rma [-i ifname] [-c chunk] [-q depth] avrace "
+		"<addr-hex> <key-hex> <base> <len> <dead-addr-hex>\n"
 		"       (-m: FI_AV_MAP, -t secs: timeout)\n");
 }
 
@@ -1135,6 +1359,10 @@ int main(int argc, char **argv)
 	else if (argc == 6 && !strcmp(argv[0], "mt"))
 		ret = run_mt(&o, argv[1], argv[2], strtoull(argv[3], NULL, 0),
 			     strtoull(argv[4], NULL, 0), argv[5]);
+	else if (argc == 6 && !strcmp(argv[0], "avrace"))
+		ret = run_avrace(&o, argv[1], argv[2],
+				 strtoull(argv[3], NULL, 0),
+				 strtoull(argv[4], NULL, 0), argv[5]);
 	else if (argc == 6 && !strcmp(argv[0], "write"))
 		ret = run_write(&o, argv[1], argv[2],
 				strtoull(argv[3], NULL, 0),

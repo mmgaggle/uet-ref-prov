@@ -201,6 +201,29 @@ mt_insert() {
 	result $rc "FI_THREAD_SAFE: writes go on while fi_av_insert waits for ARP"
 }
 
+# fi_av_insert against other calls: two threads insert one unanswering peer
+# at once and share its entry; an endpoint is closed with writes in flight
+# and reopened while another such peer is being inserted, without waiting
+# for it; posts to a dead peer fail at once and cheaply; the broadcast
+# address is refused without ARP.
+av_race() {
+	local A K B S dead rc=0 len=$((4 << 20))
+	rm -f "$TMP/addr"
+	inns ofi-a "$DIR/test_rma" -o "$TMP/addr" -t 60 target "$len" 1 \
+		> "$TMP/target.log" 2>&1 &
+	local tpid=$!
+	wait_file "$TMP/addr" || { result 1 "av race (target)"; return; }
+	read -r A K B S < "$TMP/addr"
+	dead=${A:0:32}0a590063${A:40}
+	inns ofi-b "$DIR/test_rma" -t 60 avrace "$A" "$K" "$B" "$len" "$dead" \
+		> "$TMP/w1.log" 2>&1 || rc=1
+	wait $tpid || rc=1
+	grep -a -h "^DEDUP\|^AVCUT\|^REWROTE\|^DEADPOSTS\|^BCAST\|^FAILED\|^VERIFIED\|^TIMEOUT\|^completion error" \
+		"$TMP"/w1.log "$TMP"/target.log | sed 's/^/      /'
+	rm -f "$TMP"/w*.log
+	result $rc "fi_av_insert racing inserts, a cut-off and dead peers"
+}
+
 run() {
 	echo "== FI_PROVIDER_PATH=$DIR fi_info -p uet -v (in ofi-a)"
 	sudo ip netns exec ofi-a env FI_PROVIDER_PATH="$DIR" fi_info -p uet -v
@@ -216,6 +239,7 @@ run() {
 	cutoff
 	bad_key
 	mt_insert
+	av_race
 	[ $FAILED = 0 ] && echo "all passed" || echo "some failed"
 	return $FAILED
 }
