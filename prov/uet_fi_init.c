@@ -235,6 +235,8 @@ static void uetfi_core_env(void)
 	} else {
 		setenv("UET_PDS_TX_TIMEOUT", "200", 0);
 	}
+	if (uetfi_params.rto && *uetfi_params.rto)
+		setenv("UET_PDS_RTO", uetfi_params.rto, 1);
 	if (uetfi_params.tx_retries >= 0) {
 		snprintf(val, sizeof(val), "%d", uetfi_params.tx_retries);
 		setenv("UET_PDS_MAX_TX_RETRIES", val, 1);
@@ -846,6 +848,10 @@ struct fi_provider *fi_prov_ini(void)
 			"as UET_PDS_MAX_TX_RETRIES. A target must make progress "
 			"at least once per tx_timeout * tx_retries (default: "
 			"$UET_PDS_MAX_TX_RETRIES, else 25)");
+	fi_param_define(&uetfi_prov, "rto", FI_PARAM_STRING,
+			"retransmit timeout: adaptive (RFC 6298, per peer, "
+			"starting at tx_timeout; the default) or fixed "
+			"(tx_timeout); exported as UET_PDS_RTO");
 
 	uetfi_params.segment_size = 0;	/* uetfi_segment_size() */
 	uetfi_params.max_segments = uetfi_core_desc.max_segments;
@@ -860,6 +866,7 @@ struct fi_provider *fi_prov_ini(void)
 	fi_param_get_int(&uetfi_prov, "max_segments",
 			 &uetfi_params.max_segments);
 	fi_param_get_int(&uetfi_prov, "tx_retries", &uetfi_params.tx_retries);
+	fi_param_get_str(&uetfi_prov, "rto", &uetfi_params.rto);
 	fi_param_get_str(&uetfi_prov, "encap", &uetfi_params.encap);
 	fi_param_get_size_t(&uetfi_prov, "max_payload",
 			    &uetfi_params.max_payload);

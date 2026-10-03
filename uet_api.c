@@ -6990,6 +6990,21 @@ static int uet_wire_config(struct uet_instance *uet)
 	return 0;
 }
 
+int uet_get_retx_stats(uet_handle_t handle, struct uet_retx_stats *stats)
+{
+	struct uet_instance *uet = (struct uet_instance *) handle;
+
+	if ((uet == NULL) || (stats == NULL))
+		return -FI_EINVAL;
+	memset(stats, 0, sizeof(*stats));
+	stats->retx = uet->pds.stats.retx;
+	stats->dup_rsp = uet->pds.stats.dup_rsp;
+	stats->rtt_samples = uet->pds.stats.rtt_samples;
+	stats->rto_backoffs = uet->pds.stats.rto_backoffs;
+	stats->rto_adaptive = uet->pds.rto_adaptive;
+	return FI_SUCCESS;
+}
+
 int uet_get_target_stats(uet_handle_t handle, struct uet_target_stats *stats)
 {
 	struct uet_instance *uet = (struct uet_instance *) handle;

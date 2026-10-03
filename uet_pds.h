@@ -20,6 +20,9 @@
 #define UET_PDS "UET_PDS"
 
 #define UET_DEFAULT_TX_TIMEOUT       5		/* in millisecs */
+#define UET_DEFAULT_RTO_INIT         1000	/* RFC 6298 2.1, millisecs */
+#define UET_DEFAULT_RTO_MIN          10	/* millisecs, over SRTT */
+#define UET_DEFAULT_RTO_MAX          2000	/* millisecs */
 #define UET_DEFAULT_MAX_TX_RETRIES   5
 #define UET_DEFAULT_MSL              2000	/* max seg lifetime in msecs */
 #define UET_DEFAULT_PDS_MAX_ACK_DATA 16		/* in bytes */
@@ -369,10 +372,38 @@ struct uet_pds_to_ses_funcs {
 };
 
 /* pds control block structure - embedded in uet_instance struct */
+/*
+ * The retransmit timeout. Adaptive (the default; UET_PDS_RTO=adaptive) it
+ * is RFC 6298's, estimated per peer from the round trips of packets sent
+ * once (Karn's rule), shared by the RUD PDCs and RUDI packets to the peer:
+ * SRTT + max(G, 4 RTTVAR, rto_min), at most rto_max, doubled on an expiry
+ * (once for the packets sent before it) unless a packet sent as late was
+ * answered, which makes it a loss rather than a slow path, and recomputed
+ * on the next sample.
+ * rto_min floors the margin over SRTT, as Linux's TCP does, rather than
+ * the timeout. It starts at 1 s (UET_PDS_RTO_INIT), so the first packets
+ * to a peer far away are not all sent twice before its first sample.
+ * Fixed (UET_PDS_RTO=fixed) it is tx_timeout, as before.
+ */
+struct uet_pds_rtt;
+
+struct uet_pds_stats {
+	uint64_t retx;		/* packets sent again on a timeout */
+	uint64_t dup_rsp;	/* answers to a packet already answered: a
+				 * copy that was not needed, or a lost
+				 * answer's twin */
+	uint64_t rtt_samples;
+	uint64_t rto_backoffs;
+};
+
 struct uet_pds {
 	struct uet_ses_to_pds_funcs downcall;     /* ptr's to pds functions */
 	struct uet_pds_to_ses_funcs upcall;       /* ptr's to ses functions */
 	time_t tx_timeout;               /* retry after this amount of time */
+	bool rto_adaptive;                     /* see struct uet_pds_rtt */
+	time_t rto_init, rto_min, rto_max, rto_gran;          /* millisecs */
+	struct uet_pds_rtt *rtt_ht;                 /* estimates, by peer */
+	struct uet_pds_stats stats;
 	int    max_tx_retries;             /* max tx retries before failing */
 	time_t msl;                    /* max segment lifetime in millisecs */
 	uint8_t ack_ip_tos;                             /* ip tos for ack's */
@@ -385,5 +416,18 @@ struct uet_pds {
 
 /* initialize the PDS and set the proper downcall function pointers */
 int uet_pds_init(struct uet_instance *uet);
+
+/* the estimate for a peer, made on first use; NULL without memory */
+struct uet_pds_rtt *uet_pds_rtt_get(struct uet_instance *uet,
+				    const struct uet_fa *fa, bool is_ipv6);
+/* the timeout for a packet to the peer (r may be NULL: the initial one) */
+time_t uet_pds_rtt_rto(const struct uet_instance *uet,
+		       const struct uet_pds_rtt *r);
+/* an answer to a packet sent at @sent and @retries times again */
+void uet_pds_rtt_answered(struct uet_instance *uet, struct uet_pds_rtt *r,
+			  time_t sent, int retries);
+/* the timeout of a packet sent at @sent expired */
+void uet_pds_rtt_expired(struct uet_instance *uet, struct uet_pds_rtt *r,
+			 time_t sent);
 
 #endif /* _UET_PDS_H_ */

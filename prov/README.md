@@ -263,13 +263,29 @@ atomic and collective operations return `-FI_ENOSYS`.
 |----------|---------|---------|
 | `FI_UET_IFNAME` | `$UET_IFNAME` (`$UET_ERNIC_DEVICE` for CORE=ernic) | netdev (ibverbs device for CORE=ernic) when the hints do not name one |
 | `FI_UET_RUDI` | 1 | mark remotely writable regions `IDEMPOTENT_SAFE` and set `UET_FORCE_RUDI` |
-| `FI_UET_TX_TIMEOUT` | `$UET_PDS_TX_TIMEOUT`, else 200 | retransmit timeout in ms |
+| `FI_UET_RTO` | `$UET_PDS_RTO`, else `adaptive` | `adaptive`: the retransmit timeout is RFC 6298's, estimated per peer (see below); `fixed`: it is `FI_UET_TX_TIMEOUT`. Exported as `UET_PDS_RTO` |
+| `FI_UET_TX_TIMEOUT` | `$UET_PDS_TX_TIMEOUT`, else 200 | retransmit timeout in ms, with `FI_UET_RTO=fixed` |
 | `FI_UET_TX_RETRIES` | `$UET_PDS_MAX_TX_RETRIES`, else 25 | retransmissions before a write fails |
 | `FI_UET_SEGMENT_SIZE` | 16 packets of the Payload MTU (1048576 for CORE=ernic) | bytes per write segment |
 | `FI_UET_MAX_SEGMENTS` | 2 (4 for CORE=ernic) | segments in flight per endpoint |
 | `FI_UET_PROGRESS_BURST` | 64 | core progress calls per CQ read; each handles at most one received packet |
 | `FI_UET_ENCAP` | `$UET_ENCAP`, else `udp` | `udp` (UDP port 4793) or `ip` (IP protocol 253); exported as `UET_ENCAP`. CORE=ernic: the engine's `encap=` decides |
 | `FI_UET_MAX_PAYLOAD` | `$UET_MAX_PAYLOAD`, else from the MTU | Payload MTU, 1024, 2048, 4096 or 8192; exported as `UET_MAX_PAYLOAD`. CORE=ernic: the engine's `mtu=` decides |
+
+The adaptive retransmit timeout is kept per peer address, shared by the
+RUD PDCs and the RUDI packets to it: the smoothed round trip of packets
+answered on their first transmission (Karn's rule) plus a margin of
+4 RTTVAR, at least `UET_PDS_RTO_MIN` (10 ms; it floors the margin, as
+Linux's TCP does, because a burst queued behind others is late without
+the variance showing it), at most `UET_PDS_RTO_MAX` (2000 ms). It
+doubles when a packet times out and no packet sent as late has been
+answered (a lost packet on a working path does not slow the others),
+once for those sent before, and is computed afresh from the next
+sample. Before a peer's first sample it
+is `UET_PDS_RTO_INIT` (1000 ms). `UET_PDS_STATS=1` prints, when the
+domain closes, the packets sent again (`retx`), the answers to a packet
+already answered (`dup_rsp`: copies that were not needed, or twins of
+lost answers), and each peer's estimate.
 
 When a domain is first opened, the provider sets `UET_PDS=pds` unless
 it is already set. The core reads the `UET_*` variables, so they can

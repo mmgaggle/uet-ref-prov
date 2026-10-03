@@ -438,6 +438,10 @@ static int run_target(const struct opts *o, size_t size, int writers)
 	printf("VERIFIED %zu bytes, %d signals, %.2f s after setup\n", size,
 	       signals, t_done - start);
 	fflush(stdout);
+	/* keep answering a while: a writer whose answer to the signal was
+	 * lost sends it again */
+	while (now() - t_done < 1.0)
+		fi_cq_read(r.cq, NULL, 0);
 	CHECK(fi_close(&mr->fid));
 	free(win);
 	free(expect);

@@ -57,6 +57,8 @@ struct uet_rudi_out_pkt {
 	bool               sec_hdr_built; /* sec header injected into pkt */
 	int                tx_retry_cnt;
 	time_t             tx_time;
+	time_t             deadline; /* sent again at this time */
+	struct uet_pds_rtt *rtt; /* the peer's round trip */
 	/* payload left in the message's buffer (uet_pds_rudi_tx_pkt_ref()):
 	 * pkt holds the hdr_len bytes of headers only, pkt_len counts the
 	 * payload too, and crc is computed on the first send */
@@ -122,6 +124,9 @@ static void uet_rudi_get_sec(const struct uet_instance *uet,
 /* The frame of a request whose payload is left in the message's buffer:
  * gathered into one buffer, for a shim that cannot take it in pieces.
  */
+static void uet_rudi_arm(struct uet_instance *uet,
+			 struct uet_rudi_out_pkt *rp);
+
 static int uet_rudi_send_flat_ref(struct uet_instance *uet,
 				  struct uet_rudi_out_pkt *rp)
 {
@@ -458,6 +463,7 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 	rp = calloc(1, sizeof(*rp));
 	if (rp == NULL)
 		return -ENOMEM;
+	rp->rtt = uet_pds_rtt_get(uet, &av->addr->fa, is_ipv6);
 
 	pkt_id = rudi.next_pkt_id++;
 
@@ -494,7 +500,7 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 
 	/* track for response matching (hash) + per-packet RTO (dlist) */
 	HASH_ADD(hh, rudi.out_ht, pkt_id, sizeof(rp->pkt_id), rp);
-	dlist_insert_tail(&rp->node, &rudi.rto_list);
+	uet_rudi_arm(uet, rp);
 
 	return 0;
 }
@@ -535,6 +541,7 @@ int uet_pds_rudi_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
 	rp = calloc(1, sizeof(*rp));
 	if (rp == NULL)
 		return -ENOMEM;
+	rp->rtt = uet_pds_rtt_get(uet, &av->addr->fa, is_ipv6);
 
 	pkt_id = rudi.next_pkt_id++;
 
@@ -571,7 +578,7 @@ int uet_pds_rudi_tx_pkt_ref(uet_pkt_handle_t tx_pkt_handle,
 		    pkt_id, msg_id, rp->pkt_len);
 
 	HASH_ADD(hh, rudi.out_ht, pkt_id, sizeof(rp->pkt_id), rp);
-	dlist_insert_tail(&rp->node, &rudi.rto_list);
+	uet_rudi_arm(uet, rp);
 
 	return 0;
 }
@@ -669,15 +676,73 @@ static int uet_rudi_rx_req(struct uet_instance *uet,
 	return rc;
 }
 
+/*
+ * Put a packet just sent on rto_list, which is in deadline order: at the
+ * tail, unless its peer's timeout is shorter than that of packets sent
+ * just before to another peer.
+ */
+static void uet_rudi_arm(struct uet_instance *uet,
+			 struct uet_rudi_out_pkt *rp)
+{
+	struct dlist_entry *pos;
+	struct uet_rudi_out_pkt *o;
+
+	rp->deadline = rp->tx_time + uet_pds_rtt_rto(uet, rp->rtt);
+	for (pos = rudi.rto_list.prev; pos != &rudi.rto_list;
+	     pos = pos->prev) {
+		o = container_of(pos, struct uet_rudi_out_pkt, node);
+		if (o->deadline <= rp->deadline)
+			break;
+	}
+	dlist_insert_after(&rp->node, pos);
+}
+
+/*
+ * A peer's timeout dropped to well under what its packets in flight were
+ * armed with (its first sample: they were sent with the initial timeout):
+ * arm them again with it, merged into rto_list in one pass.
+ */
+static void uet_rudi_rearm(struct uet_instance *uet, struct uet_pds_rtt *rtt)
+{
+	struct uet_rudi_out_pkt *rp, *o;
+	struct dlist_entry moved, *pos, *tmp;
+	time_t rto = uet_pds_rtt_rto(uet, rtt);
+
+	dlist_init(&moved);
+	dlist_foreach_container_safe(&rudi.rto_list, struct uet_rudi_out_pkt,
+				     rp, node, tmp) {
+		if (rp->rtt == rtt && rp->deadline > rp->tx_time + rto) {
+			dlist_remove(&rp->node);
+			dlist_insert_tail(&rp->node, &moved);
+		}
+	}
+	pos = rudi.rto_list.next;
+	while (!dlist_empty(&moved)) {
+		rp = container_of(moved.next, struct uet_rudi_out_pkt, node);
+		dlist_remove(&rp->node);
+		rp->deadline = rp->tx_time + rto;
+		while (pos != &rudi.rto_list) {
+			o = container_of(pos, struct uet_rudi_out_pkt, node);
+			if (o->deadline > rp->deadline)
+				break;
+			pos = pos->next;
+		}
+		dlist_insert_after(&rp->node, pos->prev);
+	}
+}
+
 /* Initiator: RUDI response received -> match pkt_id -> SES completion */
 static int uet_rudi_rx_rsp(struct uet_instance *uet,
 			   struct uet_parsed_pkt *pp)
 {
 	struct uet_rudi_out_pkt *rp;
+	struct uet_pds_rtt *rtt;
 	uint32_t pkt_id = pp->pds_rudi_pkt_id;
+	time_t rto;
 
 	HASH_FIND(hh, rudi.out_ht, &pkt_id, sizeof(pkt_id), rp);
 	if (rp == NULL) {
+		uet->pds.stats.dup_rsp++;
 		/* no match: dup/late response, idempotent safely ignored */
 		UET_PDS_DBG("RUDI RX RSP pkt_id %u unmatched (duplicate) -- ignored",
 			    pkt_id);
@@ -685,6 +750,9 @@ static int uet_rudi_rx_rsp(struct uet_instance *uet,
 	}
 
 	UET_PDS_DBG("RUDI RX RSP pkt_id %u -> complete", rp->pkt_id);
+	rtt = rp->rtt;
+	rto = uet_pds_rtt_rto(uet, rtt);
+	uet_pds_rtt_answered(uet, rtt, rp->tx_time, rp->tx_retry_cnt);
 
 	/* SES completion for this packet (decrements unack_pkts) */
 	uet->pds.upcall.rx_rsp(rp->tx_pkt_handle, pp);
@@ -693,6 +761,9 @@ static int uet_rudi_rx_rsp(struct uet_instance *uet,
 	dlist_remove(&rp->node);
 	free(rp->pkt_buf);
 	free(rp);
+
+	if (rtt != NULL && 2 * uet_pds_rtt_rto(uet, rtt) < rto)
+		uet_rudi_rearm(uet, rtt);
 
 	return 0;
 }
@@ -761,7 +832,7 @@ int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 	 */
 	dlist_foreach_container_safe(&rudi.rto_list, struct uet_rudi_out_pkt,
 				     rp, node, tmp) {
-		if ((now - rp->tx_time) < uet->pds.tx_timeout)
+		if (now < rp->deadline)
 			break;
 
 		if (rp->tx_retry_cnt >= uet->pds.max_tx_retries) {
@@ -783,15 +854,16 @@ int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 		}
 
 		rp->tx_retry_cnt++;
+		uet_pds_rtt_expired(uet, rp->rtt, rp->tx_time);
 
 		UET_PDS_DBG("RUDI: RTO retransmit pkt_id %u (retry %d)",
 			    rp->pkt_id, rp->tx_retry_cnt);
 
-		/* move to the tail, uet_rudi_send() refreshes tx_time */
+		/* uet_rudi_send() refreshes tx_time; then back on the list in
+		 * deadline order */
 		dlist_remove(&rp->node);
-		dlist_insert_tail(&rp->node, &rudi.rto_list);
-
 		rc = uet_rudi_send(uet, rp, true);
+		uet_rudi_arm(uet, rp);
 		if (rc != 0)
 			return rc;
 	}

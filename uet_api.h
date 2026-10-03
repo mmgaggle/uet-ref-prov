@@ -226,6 +226,24 @@ struct uet_target_stats {
  */
 int uet_get_target_stats(uet_handle_t handle, struct uet_target_stats *stats);
 
+/* what an instance's packet delivery did: retransmission and round trips */
+struct uet_retx_stats {
+	uint64_t retx;		/* packets sent again on a timeout */
+	uint64_t dup_rsp;	/* answers to a packet already answered */
+	uint64_t rtt_samples;	/* round trips measured (RTO adaptive) */
+	uint64_t rto_backoffs;	/* timeouts doubled */
+	bool rto_adaptive;
+};
+
+/*
+ * report retransmission statistics
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_EINVAL for a bad handle or a NULL stats
+ */
+int uet_get_retx_stats(uet_handle_t handle, struct uet_retx_stats *stats);
+
 /*
  * install a dma address translator
  *

@@ -177,6 +177,7 @@ struct uet_pdc {
 	UT_hash_handle         pdc_tgt_hh; /* target hash handle for the PDC */
 
 	struct dlist_entry  tx_pkt_list_head; /* 'tx_time' order (for rtx) */
+	struct uet_pds_rtt *rtt; /* the peer's round trip, NULL until used */
 
 	/* initiator side fields (and target side reverse direction) */
 	uint8_t              src_mac_addr[ETH_ALEN];
@@ -669,6 +670,7 @@ static void uet_init_pdc(struct uet_pdc *pdc,
 	memset(pdc->dst_mac_addr, 0, ETH_ALEN);
 	memset(&pdc->src_addr, 0, sizeof(struct uet_fa));
 	memset(&pdc->dst_addr, 0, sizeof(struct uet_fa));
+	pdc->rtt = NULL;
 
 	pdc->syn_offset = 0;
 	pdc->next_psn = 0;
@@ -1527,12 +1529,225 @@ static int uet_pds_target_pdc_close(struct uet_instance *uet,
 /*                             SES->PDS APIs                                */
 /****************************************************************************/
 
+/*
+ * Round-trip estimates (RFC 6298), one per peer address, kept for the
+ * life of the instance. See struct uet_pds_rtt in uet_pds.h.
+ */
+struct uet_pds_rtt_key {
+	struct uet_fa fa;
+	bool is_ipv6;
+};
+
+struct uet_pds_rtt {
+	UT_hash_handle hh;
+	struct uet_pds_rtt_key key;
+	bool sampled;		/* srtt and rttvar hold an estimate */
+	double srtt, rttvar;	/* millisecs */
+	time_t rto;		/* the timeout now, backed off */
+	time_t backoff_at;	/* when it was last backed off */
+	time_t answered_sent;	/* the latest send time of a packet answered */
+};
+
+static time_t uet_pds_rto_clamp(const struct uet_instance *uet, time_t rto)
+{
+	if (rto < uet->pds.rto_min)
+		return uet->pds.rto_min;
+	if (rto > uet->pds.rto_max)
+		return uet->pds.rto_max;
+	return rto;
+}
+
+static int uet_pds_rto_ms(const char *name, time_t def, time_t *out)
+{
+	const char *s = getenv(name);
+	char *end;
+	long v;
+
+	*out = def;
+	if (s == NULL || *s == '\0')
+		return 0;
+	v = strtol(s, &end, 10);
+	if (*end != '\0' || v < 1 || v > 600000) {
+		UET_PDS_ERR("Invalid env variable %s=%s", name, s);
+		return -EINVAL;
+	}
+	*out = v;
+	return 0;
+}
+
+static int uet_pds_rto_config(struct uet_instance *uet)
+{
+	const char *mode = getenv("UET_PDS_RTO");
+	struct timespec res;
+	int rc;
+
+	if (mode == NULL || *mode == '\0' || strcmp(mode, "adaptive") == 0) {
+		uet->pds.rto_adaptive = true;
+	} else if (strcmp(mode, "fixed") == 0) {
+		uet->pds.rto_adaptive = false;
+	} else {
+		UET_PDS_ERR("Invalid env variable UET_PDS_RTO=%s "
+			    "(adaptive or fixed)", mode);
+		return -EINVAL;
+	}
+	rc = uet_pds_rto_ms("UET_PDS_RTO_MIN", UET_DEFAULT_RTO_MIN,
+			    &uet->pds.rto_min);
+	if (rc == 0)
+		rc = uet_pds_rto_ms("UET_PDS_RTO_MAX", UET_DEFAULT_RTO_MAX,
+				    &uet->pds.rto_max);
+	if (rc == 0)
+		rc = uet_pds_rto_ms("UET_PDS_RTO_INIT", uet->pds.rto_init,
+				    &uet->pds.rto_init);
+	if (rc != 0)
+		return rc;
+	if (uet->pds.rto_max < uet->pds.rto_min)
+		uet->pds.rto_max = uet->pds.rto_min;
+	/* G: what the clock packets are stamped with can tell apart */
+	uet->pds.rto_gran = 1;
+	if (clock_getres(CLOCK_REALTIME_COARSE, &res) == 0 &&
+	    res.tv_sec == 0 && res.tv_nsec > 1000000)
+		uet->pds.rto_gran = (res.tv_nsec + 999999) / 1000000;
+	uet->pds.rtt_ht = NULL;
+	memset(&uet->pds.stats, 0, sizeof(uet->pds.stats));
+	return 0;
+}
+
+struct uet_pds_rtt *uet_pds_rtt_get(struct uet_instance *uet,
+				    const struct uet_fa *fa, bool is_ipv6)
+{
+	struct uet_pds_rtt_key key;
+	struct uet_pds_rtt *r;
+
+	if (!uet->pds.rto_adaptive)
+		return NULL;
+	memset(&key, 0, sizeof(key));
+	if (is_ipv6)
+		memcpy(key.fa.v6, fa->v6, sizeof(key.fa.v6));
+	else
+		key.fa.v4 = fa->v4;
+	key.is_ipv6 = is_ipv6;
+	HASH_FIND(hh, uet->pds.rtt_ht, &key, sizeof(key), r);
+	if (r != NULL)
+		return r;
+	r = calloc(1, sizeof(*r));
+	if (r == NULL)
+		return NULL;
+	r->key = key;
+	r->rto = uet_pds_rto_clamp(uet, uet->pds.rto_init);
+	HASH_ADD(hh, uet->pds.rtt_ht, key, sizeof(r->key), r);
+	return r;
+}
+
+time_t uet_pds_rtt_rto(const struct uet_instance *uet,
+		       const struct uet_pds_rtt *r)
+{
+	if (!uet->pds.rto_adaptive)
+		return uet->pds.tx_timeout;
+	if (r == NULL)
+		return uet_pds_rto_clamp(uet, uet->pds.rto_init);
+	return r->rto;
+}
+
+void uet_pds_rtt_answered(struct uet_instance *uet, struct uet_pds_rtt *r,
+			  time_t sent, int retries)
+{
+	time_t now;
+	double m, var, dev;
+
+	if (r == NULL)
+		return;
+	if (sent > r->answered_sent)
+		r->answered_sent = sent;
+	/* Karn: the answer to a packet sent again could be to either copy */
+	if (retries != 0)
+		return;
+	uet_gettime(&now);
+	if (now < sent)
+		return;
+	m = (double)(now - sent);
+	if (!r->sampled) {
+		r->srtt = m;
+		r->rttvar = m / 2;
+		r->sampled = true;
+	} else {
+		dev = r->srtt > m ? r->srtt - m : m - r->srtt;
+		r->rttvar = 0.75 * r->rttvar + 0.25 * dev;
+		r->srtt = 0.875 * r->srtt + 0.125 * m;
+	}
+	/* the margin over SRTT is at least rto_min, as Linux floors it: a
+	 * margin of 4 RTTVAR alone, on a path whose variance is low until a
+	 * burst queues up, times packets out that are only late */
+	var = 4 * r->rttvar;
+	if (var < (double)uet->pds.rto_gran)
+		var = (double)uet->pds.rto_gran;
+	if (var < (double)uet->pds.rto_min)
+		var = (double)uet->pds.rto_min;
+	r->rto = uet_pds_rto_clamp(uet, (time_t)(r->srtt + var + 0.5));
+	uet->pds.stats.rtt_samples++;
+}
+
+void uet_pds_rtt_expired(struct uet_instance *uet, struct uet_pds_rtt *r,
+			 time_t sent)
+{
+	uet->pds.stats.retx++;
+	/* A packet sent as late or later has been answered: the path works,
+	 * and this one was lost alone; the timeout is not what is wrong. */
+	if (r == NULL || r->answered_sent >= sent)
+		return;
+	/* once per expiry: the packets sent before the last backoff timed
+	 * out against the timeout it already doubled */
+	if (sent < r->backoff_at)
+		return;
+	r->rto = uet_pds_rto_clamp(uet, 2 * r->rto);
+	uet_gettime(&r->backoff_at);
+	uet->pds.stats.rto_backoffs++;
+}
+
+static void uet_pds_rtt_finalize(struct uet_instance *uet)
+{
+	struct uet_pds_rtt *r, *tmp;
+
+	if (getenv("UET_PDS_STATS"))
+		fprintf(stderr, "uet-pds: rto %s retx %lu dup_rsp %lu "
+			"rtt_samples %lu rto_backoffs %lu\n",
+			uet->pds.rto_adaptive ? "adaptive" : "fixed",
+			(unsigned long)uet->pds.stats.retx,
+			(unsigned long)uet->pds.stats.dup_rsp,
+			(unsigned long)uet->pds.stats.rtt_samples,
+			(unsigned long)uet->pds.stats.rto_backoffs);
+	UET_PDS_INFO("%-30s : %s", "rto",
+		     uet->pds.rto_adaptive ? "adaptive" : "fixed");
+	UET_PDS_INFO("%-30s : %lu", "retx",
+		     (unsigned long)uet->pds.stats.retx);
+	UET_PDS_INFO("%-30s : %lu", "dup_rsp",
+		     (unsigned long)uet->pds.stats.dup_rsp);
+	UET_PDS_INFO("%-30s : %lu", "rtt_samples",
+		     (unsigned long)uet->pds.stats.rtt_samples);
+	HASH_ITER(hh, uet->pds.rtt_ht, r, tmp) {
+		if (getenv("UET_PDS_STATS"))
+			fprintf(stderr, "uet-pds: peer %08x srtt %.1f rttvar "
+				"%.1f rto %ld ms\n", r->key.fa.v4, r->srtt,
+				r->rttvar, (long)r->rto);
+		HASH_DEL(uet->pds.rtt_ht, r);
+		free(r);
+	}
+}
+
+/* a PDC's estimate: its peer's */
+static struct uet_pds_rtt *uet_pdc_rtt(struct uet_instance *uet,
+				       struct uet_pdc *pdc)
+{
+	if (pdc->rtt == NULL)
+		pdc->rtt = uet_pds_rtt_get(uet, &pdc->dst_addr, pdc->is_ipv6);
+	return pdc->rtt;
+}
+
 int uet_pds_initialize(struct uet_instance *uet)
 {
 	struct uet_pdc *pdc;
 	char *pds_ack_type;
 	char *method;
-	int i;
+	int i, rc;
 
 	/* seed random number generator for PDC close and packet drop */
 	srand(time(NULL));
@@ -1588,12 +1803,18 @@ int uet_pds_initialize(struct uet_instance *uet)
 	uet->pds.tx_timeout     = UET_DEFAULT_TX_TIMEOUT;
 	uet->pds.max_tx_retries = UET_DEFAULT_MAX_TX_RETRIES;
 	uet->pds.msl            = UET_DEFAULT_MSL;
+	uet->pds.rto_init       = UET_DEFAULT_RTO_INIT;
 
 	/* configure the tx timeout (in millisecs) */
 	if (getenv("UET_PDS_TX_TIMEOUT")) {
 		uet->pds.tx_timeout =
 			strtoul(getenv("UET_PDS_TX_TIMEOUT"), NULL, 10);
 	}
+
+	/* configure the retransmit timeout: adaptive or fixed */
+	rc = uet_pds_rto_config(uet);
+	if (rc != 0)
+		return rc;
 
 	/* configure the max tx retries */
 	if (getenv("UET_PDS_MAX_TX_RETRIES")) {
@@ -1679,6 +1900,8 @@ void uet_pds_finalize(struct uet_instance *uet)
 	struct uet_pdc_pkt *pdc_pkt;
 
 	PDS_GO();
+
+	uet_pds_rtt_finalize(uet);
 
 	/* PDS health stats: DoS-reaped PENDING PDCs + PSN-range-driven closes */
 	UET_PDS_INFO("%-30s : %u", "new_pdc_timeout_cnt",
@@ -2503,7 +2726,7 @@ static int uet_pds_check_rtx_pkt(struct uet_instance *uet,
 
 	uet_gettime(&now);
 	delta = (now - pdc_pkt->tx_time);
-	if (delta < uet->pds.tx_timeout)
+	if (delta < uet_pds_rtt_rto(uet, uet_pdc_rtt(uet, pdc)))
 		return 0; /* no retransmit */
 
 	if (!pdc_pkt->dst_recvd &&
@@ -2518,6 +2741,7 @@ static int uet_pds_check_rtx_pkt(struct uet_instance *uet,
 
 	UET_PDS_WARN("PDC %u PSN %u retransmit", pdc->pdc_id, pdc_pkt->psn);
 
+	uet_pds_rtt_expired(uet, uet_pdc_rtt(uet, pdc), pdc_pkt->tx_time);
 	rc = uet_pds_rtx_pkt(uet, pdc, pdc_pkt);
 	if (rc == -EAGAIN)
 		return 0; /* wait for CACK to advance the peer window */
@@ -3775,6 +3999,7 @@ static int uet_pds_process_ack(struct uet_instance *uet,
 		return -EINVAL;
 	} else if (pdc_pkt->tx_pkt_acked) {
 		duplicate = true;
+		uet->pds.stats.dup_rsp++;
 	}
 
 	/*
@@ -3784,6 +4009,8 @@ static int uet_pds_process_ack(struct uet_instance *uet,
 	if (!duplicate) {
 		pdc_pkt->tx_pkt_acked = true;
 		dlist_remove(&pdc_pkt->node); /* remove from Tx list */
+		uet_pds_rtt_answered(uet, uet_pdc_rtt(uet, pdc),
+				     pdc_pkt->tx_time, pdc_pkt->tx_retry_cnt);
 	}
 
 	if (pp->pds_type == UET_PDS_TYPE_ACK_CC ||

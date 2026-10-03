@@ -136,7 +136,8 @@ struct uetfi_params {
 	int progress_burst;	/* FI_UET_PROGRESS_BURST */
 	size_t segment_size;	/* FI_UET_SEGMENT_SIZE, 0 => the core's */
 	int max_segments;	/* FI_UET_MAX_SEGMENTS */
-	int tx_retries;		/* FI_UET_TX_RETRIES, <0 => unset */
+	int tx_retries;
+	char *rto;		/* FI_UET_RTO: adaptive or fixed */		/* FI_UET_TX_RETRIES, <0 => unset */
 	char *encap;		/* FI_UET_ENCAP, NULL => $UET_ENCAP */
 	size_t max_payload;	/* FI_UET_MAX_PAYLOAD, 0 => from the MTU */
 };
