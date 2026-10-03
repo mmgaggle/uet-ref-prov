@@ -339,6 +339,8 @@ struct uet_av_entry {
 #define UET_NH_MAC_ADDR_V (1 << 0)  /* flag bit indicating next-hop mac valid */
 	uint16_t flags;
 	uint8_t nh_mac_addr[ETH_ALEN];                /* next-hop mac address */
+	time_t nh_checked;   /* last next-hop lookup (ms), 0 if none was made */
+	int nh_rc;              /* its answer while the mac address is invalid */
 	_Atomic size_t num_active_ops; /* num active operations using this av */
 			    /* ses generation for untagged msg's to this dest */
 	_Atomic uint32_t untagged_gen;

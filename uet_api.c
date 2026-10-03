@@ -6252,6 +6252,73 @@ static ssize_t uet_recv_api_common(
 }
 
 /*
+ * how often a post looks up the next hop of a peer through the kernel:
+ * one that is not resolved yet at most every UET_AV_NH_RETRY_MS (a caller
+ * polling for it is told the last answer in between), and one that is,
+ * again every UET_AV_NH_RECHECK_MS
+ */
+#define UET_AV_NH_RETRY_MS	5
+#define UET_AV_NH_RECHECK_MS	10000
+
+/*
+ * keep the next-hop mac address of a peer current for a post
+ *
+ * A peer that resolves is used from then on. Its next hop is looked up
+ * again from time to time while it is used: a new mac address replaces
+ * the old one (a connection set up already keeps the one it started
+ * with), a next hop that failed makes the peer unresolved again, and an
+ * answer still pending keeps the address in use. A shim with a resolver
+ * of its own answers from a table, so a peer it has not resolved yet is
+ * asked about on every post.
+ *
+ * parms:
+ *      uet      - ptr to uet instance struct
+ *      av_entry - ptr to av entry of the peer
+ *
+ * returns:
+ *      FI_SUCCESS with a valid next-hop mac address in av_entry
+ *      -FI_EAGAIN while the next hop is being resolved
+ *      negative value corresponding to errno for a peer that cannot be
+ *      reached
+ */
+static int uet_av_check_nh(struct uet_instance *uet,
+			   struct uet_av_entry *av_entry)
+{
+	struct uet_nic *nic = UET_NIC(uet);
+	bool valid = (av_entry->flags & UET_NH_MAC_ADDR_V) != 0;
+	uint8_t mac[ETH_ALEN];
+	time_t now, since;
+	int rc;
+
+	uet_gettime(&now);
+	/* a clock set back counts as time enough */
+	since = now >= av_entry->nh_checked ? now - av_entry->nh_checked :
+					      UET_AV_NH_RECHECK_MS;
+	if (valid) {
+		/* an entry with no lookup made (a reply's own address) is
+		 * never checked */
+		if (av_entry->nh_checked == 0 || since < UET_AV_NH_RECHECK_MS)
+			return FI_SUCCESS;
+	} else if (nic->nic_resolve_nh == NULL && since < UET_AV_NH_RETRY_MS) {
+		return av_entry->nh_rc;
+	}
+
+	rc = uet_nic_get_nh_nowait(nic, &av_entry->addr->fa,
+				   uet_addr_is_ipv6(av_entry->addr), mac);
+	av_entry->nh_checked = now;
+	if (rc == FI_SUCCESS) {
+		memcpy(av_entry->nh_mac_addr, mac, ETH_ALEN);
+		av_entry->flags |= UET_NH_MAC_ADDR_V;
+		return FI_SUCCESS;
+	}
+	if (valid && rc != -ENETUNREACH && rc != -EHOSTUNREACH)
+		return FI_SUCCESS;	/* asked again; keep using it */
+	av_entry->flags &= ~UET_NH_MAC_ADDR_V;
+	av_entry->nh_rc = rc;
+	return rc;
+}
+
+/*
  * common function for api's that send requests
  *   - the send_req_api determines which parms are valid
  * This function supports both IO vector (iov) mode and buffer mode:
@@ -6304,14 +6371,9 @@ static ssize_t uet_send_req_api_common(
 
 	/* check next-hop mac address; a post never waits for ARP, so a
 	 * caller retries on -FI_EAGAIN and a dead peer fails at once */
-	if (!(av_entry->flags & UET_NH_MAC_ADDR_V)) {
-		rc = uet_nic_get_nh_nowait(UET_NIC(uet), &av_entry->addr->fa,
-					   uet_addr_is_ipv6(av_entry->addr),
-					   av_entry->nh_mac_addr);
-		if (rc != FI_SUCCESS)
-			return rc;
-		av_entry->flags |= UET_NH_MAC_ADDR_V;
-	}
+	rc = uet_av_check_nh(uet, av_entry);
+	if (rc != FI_SUCCESS)
+		return rc;
 
 	/* A segment list describes the buffer with memory regions rather
 	 * than with addresses in this process. Validate it once here so a
@@ -8105,6 +8167,8 @@ int uet_av_insert(uet_domain_handle_t domain_handle,
 	rc = uet_nic_get_nh(UET_NIC(uet), &uet_addr->fa,
 			    uet_addr_is_ipv6(uet_addr),
 			    av_entry->nh_mac_addr);
+	uet_gettime(&av_entry->nh_checked);
+	av_entry->nh_rc = rc;
 	if (rc == FI_SUCCESS)
 		av_entry->flags |= UET_NH_MAC_ADDR_V;
 

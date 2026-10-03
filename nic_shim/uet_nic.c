@@ -11,6 +11,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <sys/ioctl.h>
+#include <sys/time.h>
 #include <net/if.h>
 #include <net/if_arp.h>
 #include <sys/socket.h>
@@ -136,10 +137,16 @@ int uet_nic_get_ipv6_addr(const char *ifname,
  * than asking to be tried again for as long as the kernel keeps asking by
  * ARP. UET_NH_WAIT_MS=0 makes uet_av_insert() not wait either.
  *
+ * Only a unicast route is used (an IPv4 gateway may come as RTA_GATEWAY,
+ * as an RTA_VIA, or inside a multipath route), and a MAC in a stale entry
+ * is used while a probe asks the kernel to check it again: the raw socket
+ * never confirms a neighbor itself. The core checks a peer's MAC again
+ * from time to time (see uet_api.c).
+ *
  * This replaces "ip route get", "arp -d" and "ping", which took a process
  * each, deleted a good entry first, and waited up to 10 s for an echo
- * reply from a peer that does not answer ping. The scratch is local and
- * the table of next hops is locked, so threads may resolve at once.
+ * reply from a peer that does not answer ping. The netlink socket and the
+ * table of next hops are locked, so threads may resolve at once.
  */
 #define UET_NH_WAIT_MS_ENV	"UET_NH_WAIT_MS"
 #define UET_NH_WAIT_MS_DEF	1000
@@ -147,6 +154,7 @@ int uet_nic_get_ipv6_addr(const char *ifname,
 #define UET_NH_POLL_US		1000	/* neighbor table polling interval */
 #define UET_NH_PROBE_PORT	9	/* discard */
 #define UET_NL_BUF		16384
+#define UET_NL_TIMEOUT_MS	1000	/* a bound; the kernel answers */
 
 static uint64_t uet_nh_now_ms(void)
 {
@@ -171,9 +179,42 @@ static int uet_nh_wait_ms(void)
 }
 
 /*
- * Send a request on a fresh NETLINK_ROUTE socket and hand every reply
- * message to cb, until NLMSG_DONE for a dump or the one reply otherwise.
- * Returns 0, a negative errno from the kernel, or one of the socket's.
+ * One NETLINK_ROUTE socket for the process, kept open, used by one request
+ * at a time. It asks for strict checking, so a dump honors the filters in
+ * its header (the neighbor table of one interface). Requests are numbered,
+ * and answers to an earlier one that timed out are skipped.
+ */
+static pthread_mutex_t uet_nl_lock = PTHREAD_MUTEX_INITIALIZER;
+static int uet_nl_fd = -1;
+static uint32_t uet_nl_seq;
+
+static int uet_nl_open_locked(void)
+{
+	struct timeval tv = {
+		.tv_sec = UET_NL_TIMEOUT_MS / 1000,
+		.tv_usec = (UET_NL_TIMEOUT_MS % 1000) * 1000,
+	};
+	int one = 1;
+
+	if (uet_nl_fd >= 0)
+		return 0;
+	uet_nl_fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (uet_nl_fd < 0)
+		return -errno;
+	(void)setsockopt(uet_nl_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#ifdef NETLINK_GET_STRICT_CHK
+	(void)setsockopt(uet_nl_fd, SOL_NETLINK, NETLINK_GET_STRICT_CHK, &one,
+			 sizeof(one));
+#else
+	(void)one;
+#endif
+	return 0;
+}
+
+/*
+ * Send a request and hand every answer message to cb, until NLMSG_DONE
+ * for a dump or the one answer otherwise. Returns 0, a negative errno
+ * from the kernel, or one of the socket's.
  */
 static int uet_nl_request(struct nlmsghdr *req,
 			  void (*cb)(const struct nlmsghdr *, void *),
@@ -181,32 +222,32 @@ static int uet_nl_request(struct nlmsghdr *req,
 {
 	struct sockaddr_nl sa;
 	char *buf;
-	int fd, rc = 0;
+	int rc = 0;
 	bool dump = (req->nlmsg_flags & NLM_F_DUMP) != 0;
 	bool done = false;
-
-	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
-	if (fd < 0)
-		return -errno;
-
-	memset(&sa, 0, sizeof(sa));
-	sa.nl_family = AF_NETLINK;
-	req->nlmsg_seq = 1;
-	if (sendto(fd, req, req->nlmsg_len, 0, (struct sockaddr *)&sa,
-		   sizeof(sa)) < 0) {
-		rc = -errno;
-		close(fd);
-		return rc;
-	}
+	uint32_t seq;
 
 	buf = malloc(UET_NL_BUF);
-	if (buf == NULL) {
-		close(fd);
+	if (buf == NULL)
 		return -ENOMEM;
+
+	pthread_mutex_lock(&uet_nl_lock);
+	rc = uet_nl_open_locked();
+	if (rc != 0)
+		goto out;
+
+	seq = ++uet_nl_seq;
+	req->nlmsg_seq = seq;
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	if (sendto(uet_nl_fd, req, req->nlmsg_len, 0, (struct sockaddr *)&sa,
+		   sizeof(sa)) < 0) {
+		rc = -errno;
+		goto broken;
 	}
 
 	while (!done) {
-		ssize_t n = recv(fd, buf, UET_NL_BUF, 0);
+		ssize_t n = recv(uet_nl_fd, buf, UET_NL_BUF, 0);
 		struct nlmsghdr *h;
 		int len;
 
@@ -214,13 +255,13 @@ static int uet_nl_request(struct nlmsghdr *req,
 			if (errno == EINTR)
 				continue;
 			rc = -errno;
-			break;
+			goto broken;
 		}
 		len = (int)n;
 		for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, len);
 		     h = NLMSG_NEXT(h, len)) {
-			if (h->nlmsg_seq != 1)
-				continue;
+			if (h->nlmsg_seq != seq)
+				continue;	/* a stale answer */
 			if (h->nlmsg_type == NLMSG_DONE) {
 				done = true;
 				break;
@@ -239,9 +280,15 @@ static int uet_nl_request(struct nlmsghdr *req,
 			}
 		}
 	}
+	goto out;
 
+broken:
+	/* a socket in an unknown state is not used again */
+	close(uet_nl_fd);
+	uet_nl_fd = -1;
+out:
+	pthread_mutex_unlock(&uet_nl_lock);
 	free(buf);
-	close(fd);
 	return rc;
 }
 
@@ -258,9 +305,41 @@ static void uet_nl_add_attr(struct nlmsghdr *h, unsigned short type,
 }
 
 struct uet_nl_route {
+	int ifindex;	/* the interface the route must leave by */
 	bool found;
+	uint8_t type;	/* rtm_type */
 	uint32_t gw;	/* network order, 0 if on-link */
+	int gw_err;	/* a gateway this cannot use (IPv6 via) */
 };
+
+/* a gateway given as RTA_GATEWAY or as an IPv4 RTA_VIA */
+static void uet_nl_route_gw(const struct rtattr *rta, struct uet_nl_route *r)
+{
+	if (rta->rta_type == RTA_GATEWAY &&
+	    RTA_PAYLOAD(rta) == sizeof(uint32_t)) {
+		memcpy(&r->gw, RTA_DATA(rta), sizeof(uint32_t));
+	} else if (rta->rta_type == RTA_VIA &&
+		   RTA_PAYLOAD(rta) >= sizeof(struct rtvia)) {
+		const struct rtvia *via = RTA_DATA(rta);
+
+		if (via->rtvia_family == AF_INET &&
+		    RTA_PAYLOAD(rta) >= sizeof(*via) + sizeof(uint32_t))
+			memcpy(&r->gw, via->rtvia_addr, sizeof(uint32_t));
+		else
+			r->gw_err = -EAFNOSUPPORT;
+	}
+}
+
+/* the gateway of one path of a multipath route */
+static void uet_nl_route_nh(const struct rtnexthop *nh,
+			    struct uet_nl_route *r)
+{
+	const struct rtattr *a = RTNH_DATA(nh);
+	int len = nh->rtnh_len - RTNH_LENGTH(0);
+
+	for (; RTA_OK(a, len); a = RTA_NEXT(a, len))
+		uet_nl_route_gw(a, r);
+}
 
 static void uet_nl_route_cb(const struct nlmsghdr *h, void *arg)
 {
@@ -272,11 +351,25 @@ static void uet_nl_route_cb(const struct nlmsghdr *h, void *arg)
 	if (h->nlmsg_type != RTM_NEWROUTE || rtm->rtm_family != AF_INET)
 		return;
 	r->found = true;
+	r->type = rtm->rtm_type;
 	len = (int)RTM_PAYLOAD(h);
 	for (rta = RTM_RTA(rtm); RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
-		if (rta->rta_type == RTA_GATEWAY &&
-		    RTA_PAYLOAD(rta) == sizeof(uint32_t))
-			memcpy(&r->gw, RTA_DATA(rta), sizeof(uint32_t));
+		if (rta->rta_type == RTA_MULTIPATH) {
+			/* the path out of the interface asked for */
+			const struct rtnexthop *nh = RTA_DATA(rta);
+			int left = (int)RTA_PAYLOAD(rta);
+
+			while (RTNH_OK(nh, left)) {
+				if (nh->rtnh_ifindex == r->ifindex) {
+					uet_nl_route_nh(nh, r);
+					break;
+				}
+				left -= NLMSG_ALIGN(nh->rtnh_len);
+				nh = RTNH_NEXT(nh);
+			}
+		} else {
+			uet_nl_route_gw(rta, r);
+		}
 	}
 }
 
@@ -289,7 +382,7 @@ static int uet_nl_next_hop(int ifindex, uint32_t dst, uint32_t *nh)
 		struct rtmsg r;
 		char attrs[64];
 	} req;
-	struct uet_nl_route route = { 0 };
+	struct uet_nl_route route = { .ifindex = ifindex };
 	int rc;
 
 	memset(&req, 0, sizeof(req));
@@ -306,6 +399,11 @@ static int uet_nl_next_hop(int ifindex, uint32_t dst, uint32_t *nh)
 		return rc;
 	if (!route.found)
 		return -ENETUNREACH;
+	/* local, broadcast, blackhole, ...: nothing to send a frame to */
+	if (route.type != RTN_UNICAST)
+		return -EHOSTUNREACH;
+	if (route.gw_err)
+		return route.gw_err;
 	*nh = route.gw != 0 ? route.gw : dst;
 	return 0;
 }
@@ -354,20 +452,44 @@ static void uet_nl_neigh_cb(const struct nlmsghdr *h, void *arg)
 		memcpy(q->mac, mac, ETH_ALEN);
 }
 
-/* the neighbor entry of @ip (network order) on @ifindex */
+/*
+ * The neighbor entry of @ip (network order) on @ifindex: one entry by its
+ * address, or, from a kernel that cannot get one entry (before 5.0), a
+ * dump of the interface's table. A dump asked with strict checking takes
+ * the interface as an attribute and a header without one.
+ */
 static int uet_nl_neighbor(struct uet_nl_neigh *q)
 {
 	struct {
 		struct nlmsghdr h;
 		struct ndmsg n;
+		char attrs[32];
 	} req;
+	uint32_t ifindex;
+	int rc;
+
+	memset(&req, 0, sizeof(req));
+	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	req.h.nlmsg_type = RTM_GETNEIGH;
+	req.h.nlmsg_flags = NLM_F_REQUEST;
+	req.n.ndm_family = AF_INET;
+	req.n.ndm_ifindex = q->ifindex;
+	uet_nl_add_attr(&req.h, NDA_DST, &q->ip, sizeof(q->ip));
+	q->found = false;
+	rc = uet_nl_request(&req.h, uet_nl_neigh_cb, q);
+	if (rc == -ENOENT)
+		return 0;	/* no entry */
+	if (rc != -EINVAL && rc != -EOPNOTSUPP)
+		return rc;
 
 	memset(&req, 0, sizeof(req));
 	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
 	req.h.nlmsg_type = RTM_GETNEIGH;
 	req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
 	req.n.ndm_family = AF_INET;
-	req.n.ndm_ifindex = q->ifindex;	/* a filter, where the kernel has it */
+	/* the filter; a kernel without it sends every interface's table */
+	ifindex = (uint32_t)q->ifindex;
+	uet_nl_add_attr(&req.h, NDA_IFINDEX, &ifindex, sizeof(ifindex));
 	q->found = false;
 	return uet_nl_request(&req.h, uet_nl_neigh_cb, q);
 }
@@ -382,14 +504,23 @@ static bool uet_nl_neigh_usable(const struct uet_nl_neigh *q)
 	       memcmp(q->mac, zero, ETH_ALEN) != 0;
 }
 
+/* an entry the kernel is not sure of any more: frames from the raw socket
+ * never confirm it, so it needs a probe to be checked again */
+static bool uet_nl_neigh_stale(const struct uet_nl_neigh *q)
+{
+	return (q->state & (NUD_STALE | NUD_DELAY | NUD_PROBE)) != 0;
+}
+
 /*
  * What is known about the next hops resolved lately, across threads: when
  * each was last probed, and whether its resolution failed. A next hop
  * that failed stays failed until it resolves again, so a caller that does
  * not wait is told at once that the peer is unreachable rather than asked
- * to try again for as long as the kernel keeps asking it by ARP.
+ * to try again for as long as the kernel keeps asking it by ARP. Only a
+ * probe or a failure takes a slot; a lookup that finds none takes nothing,
+ * so lookups cannot push a failed next hop out.
  */
-#define UET_NH_SLOTS		32
+#define UET_NH_SLOTS		64
 #define UET_NH_FAILED_PROBE_MS	1000	/* a failed one is asked this often */
 
 static pthread_mutex_t uet_nh_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -400,14 +531,33 @@ static struct {
 } uet_nh_seen[UET_NH_SLOTS];
 static unsigned int uet_nh_next;
 
-static int uet_nh_slot(uint32_t nh)
+static int uet_nh_find(uint32_t nh)
 {
 	int i;
 
 	for (i = 0; i < UET_NH_SLOTS; i++)
 		if (uet_nh_seen[i].nh == nh)
 			return i;
-	i = (int)(uet_nh_next++ % UET_NH_SLOTS);
+	return -1;
+}
+
+/* a slot for @nh: its own, else a free one, else one that has not failed,
+ * else the next in turn */
+static int uet_nh_slot(uint32_t nh)
+{
+	int i = uet_nh_find(nh);
+
+	if (i >= 0)
+		return i;
+	for (i = 0; i < UET_NH_SLOTS; i++)
+		if (uet_nh_seen[i].nh == 0)
+			break;
+	if (i == UET_NH_SLOTS)
+		for (i = 0; i < UET_NH_SLOTS; i++)
+			if (!uet_nh_seen[i].failed)
+				break;
+	if (i == UET_NH_SLOTS)
+		i = (int)(uet_nh_next++ % UET_NH_SLOTS);
 	uet_nh_seen[i].nh = nh;
 	uet_nh_seen[i].probed = 0;
 	uet_nh_seen[i].failed = false;
@@ -416,17 +566,27 @@ static int uet_nh_slot(uint32_t nh)
 
 static void uet_nh_set_failed(uint32_t nh, bool failed)
 {
+	int i;
+
 	pthread_mutex_lock(&uet_nh_lock);
-	uet_nh_seen[uet_nh_slot(nh)].failed = failed;
+	if (failed) {
+		uet_nh_seen[uet_nh_slot(nh)].failed = true;
+	} else {
+		i = uet_nh_find(nh);
+		if (i >= 0)
+			uet_nh_seen[i].failed = false;
+	}
 	pthread_mutex_unlock(&uet_nh_lock);
 }
 
 static bool uet_nh_is_failed(uint32_t nh)
 {
 	bool failed;
+	int i;
 
 	pthread_mutex_lock(&uet_nh_lock);
-	failed = uet_nh_seen[uet_nh_slot(nh)].failed;
+	i = uet_nh_find(nh);
+	failed = i >= 0 && uet_nh_seen[i].failed;
 	pthread_mutex_unlock(&uet_nh_lock);
 	return failed;
 }
@@ -499,7 +659,7 @@ int uet_nic_resolve_ipv4_nh_wait(struct uet_nic *nic,
 	inet_ntop(AF_INET, &dst, dst_str, sizeof(dst_str));
 	rc = uet_nl_next_hop(ifindex, dst, &nh);
 	if (rc != 0) {
-		UET_API_ERR("No route to %s out of %s: %s", dst_str,
+		UET_API_ERR("No usable route to %s out of %s: %s", dst_str,
 			    nic->ifname, strerror(-rc));
 		return -ENETUNREACH;
 	}
@@ -538,14 +698,19 @@ int uet_nic_resolve_ipv4_nh_wait(struct uet_nic *nic,
 		usleep(UET_NH_POLL_US);
 	}
 	uet_nh_set_failed(nh, false);
+	/* a MAC the kernel no longer vouches for is used, and checked */
+	if (uet_nl_neigh_stale(&q))
+		uet_nh_probe(nic->ifname, ifindex, nh);
 
 	memcpy(mac, q.mac, ETH_ALEN);
 
-	printf("Next-Hop Address Resolution\n");
-	printf("  Destination IPv4 Addr: %s\n", dst_str);
-	printf("  Next-Hop IPv4 Addr:    %s\n", nh_str);
-	printf("  Next-Hop MAC Addr:     ");
-	uet_print_mac_addr(mac);
+	if (wait_ms != 0) {
+		printf("Next-Hop Address Resolution\n");
+		printf("  Destination IPv4 Addr: %s\n", dst_str);
+		printf("  Next-Hop IPv4 Addr:    %s\n", nh_str);
+		printf("  Next-Hop MAC Addr:     ");
+		uet_print_mac_addr(mac);
+	}
 
 	return 0;
 }
