@@ -9442,6 +9442,38 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 	}
 }
 
+int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
+		  void *optval, size_t *optlen)
+{
+	struct uet_ep *uet_ep = (struct uet_ep *) ep_handle;
+	bool v;
+
+	if ((uet_ep == NULL) || (level != FI_OPT_ENDPOINT))
+		return -FI_ENOSYS;
+
+	switch (optname) {
+	case UET_OPT_FORCE_RUDI:
+		pthread_mutex_lock(&uet_ep->data_lock);
+		v = uet_ep->force_rudi;
+		pthread_mutex_unlock(&uet_ep->data_lock);
+		break;
+	case UET_OPT_ABORT:
+		v = uet_ep->uet_domain->uet->pds.downcall.ep_abort != NULL;
+		break;
+	default:
+		return -FI_ENOSYS;
+	}
+
+	if ((optval == NULL) || (optlen == NULL) || (*optlen < sizeof(bool))) {
+		if (optlen)
+			*optlen = sizeof(bool);
+		return -FI_ETOOSMALL;
+	}
+	*(bool *)optval = v;
+	*optlen = sizeof(bool);
+	return FI_SUCCESS;
+}
+
 int uet_cntr_read(uet_cntr_handle_t cntr_handle, uint64_t *value)
 {
 	return -FI_ENOSYS;

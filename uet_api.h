@@ -972,6 +972,33 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 #define UET_OPT_FORCE_RUDI ((int)(FI_PROV_SPECIFIC | 1U))
 
 /*
+ * UET_OPT_ABORT (bool, read only, uet_ep_getopt())
+ *   Whether uet_ep_abort() can discard what the endpoint has outstanding.
+ *   False when the packet delivery sublayer cannot (UET_PDS=sng): its
+ *   uet_ep_abort() returns -FI_ENOSYS, and the packets already sent stay
+ *   with the endpoint until they are acknowledged.
+ */
+#define UET_OPT_ABORT ((int)(FI_PROV_SPECIFIC | 2U))
+
+/*
+ * read an endpoint option
+ *
+ * parms:
+ *   ep_handle - handle identifying uet endpoint instance
+ *   level     - FI_OPT_ENDPOINT
+ *   optname   - UET_OPT_FORCE_RUDI or UET_OPT_ABORT
+ *   optval    - where the value goes
+ *   optlen    - in: the room at optval; out: the value's size
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_ETOOSMALL if optval has too little room,
+ *   -FI_ENOSYS for an unknown level or option
+ */
+int uet_ep_getopt(uet_ep_handle_t ep_handle, int level, int optname,
+		  void *optval, size_t *optlen);
+
+/*
  * discard everything an endpoint has outstanding, ahead of closing it
  *
  * Every operation the endpoint has in flight or queued is dropped: none
