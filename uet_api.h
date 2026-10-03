@@ -999,6 +999,32 @@ int uet_ep_setopt(uet_ep_handle_t ep_handle, int level, int optname,
 int uet_ep_abort(uet_ep_handle_t ep_handle);
 
 /*
+ * discard one outstanding operation, as uet_ep_abort() discards all of an
+ * endpoint's
+ *
+ * The operation posted with @context is dropped: none of its packets is
+ * sent or retransmitted again, and no completion is reported for it. Other
+ * operations carry on, with one exception: a RUD or ROD message that
+ * loses un-ACK'ed packets leaves holes in its PDC's PSN space, so the PDC
+ * is closed with its peer, and the other messages that still have
+ * packets on it fail with an error completion. RUDI has no PDC, so
+ * aborting a RUDI operation disturbs nothing else. This is for callers
+ * that share one endpoint among several users, such as a device model
+ * whose guests all post through one endpoint.
+ *
+ * parms:
+ *   ep_handle - handle identifying uet endpoint instance
+ *   context   - the context the operation was posted with
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_ENOENT if no operation with @context is outstanding (it may have
+ *              completed, with its completion still in the queue),
+ *   -FI_ENOSYS if the packet delivery sublayer (UET_PDS) cannot abort
+ */
+int uet_ep_abort_op(uet_ep_handle_t ep_handle, void *context);
+
+/*
  * called when an endpoint is closed
  *
  * parms:

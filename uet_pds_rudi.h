@@ -83,4 +83,9 @@ int uet_pds_rudi_rx(struct uet_instance *uet, struct uet_parsed_pkt *pp,
  */
 void uet_pds_rudi_ep_abort(struct uet_ep *uet_ep);
 
+/* The same for the outstanding RUDI requests of one message, the ones sent
+ * with @tx_pkt_handle. Requests of other messages are left alone.
+ */
+void uet_pds_rudi_msg_abort(uet_pkt_handle_t tx_pkt_handle);
+
 #endif /* _UET_PDS_RUDI_H_ */

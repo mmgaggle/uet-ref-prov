@@ -729,6 +729,21 @@ void uet_pds_rudi_ep_abort(struct uet_ep *uet_ep)
 	}
 }
 
+void uet_pds_rudi_msg_abort(uet_pkt_handle_t tx_pkt_handle)
+{
+	struct uet_rudi_out_pkt *rp, *tmp;
+
+	HASH_ITER(hh, rudi.out_ht, rp, tmp) {
+		if (rp->tx_pkt_handle != tx_pkt_handle)
+			continue;
+
+		HASH_DEL(rudi.out_ht, rp);
+		dlist_remove(&rp->node);
+		free(rp->pkt_buf);
+		free(rp);
+	}
+}
+
 int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 			     uet_pkt_handle_t *err_pkt_handle)
 {

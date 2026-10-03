@@ -4499,17 +4499,32 @@ void uet_pds_ep_close_wait(struct uet_ep *uet_ep)
 }
 
 /*
- * Retire a PDC that lost un-ACK'ed packets to an endpoint abort. Its PSN
- * space now has holes the peer will never see filled, so the PDC cannot
- * carry traffic any more. Every packet it tracks is freed, those of other
- * endpoints failed up to SES as closing in error would, and the PDC is
- * closed with the peer: a CLOSE command makes the target clear all PSNs
- * and free its side. The CLOSE carries no payload. A PDC that was never
- * established has no peer state to close and is freed.
+ * Whether an abort drops a packet: with @tx_pkt_handle, the packets of that
+ * one message; without, every packet of @uet_ep.
+ */
+static bool uet_pds_pkt_aborted(const struct uet_pdc_pkt *pdc_pkt,
+				const struct uet_ep *uet_ep,
+				uet_pkt_handle_t tx_pkt_handle)
+{
+	if (tx_pkt_handle != NULL)
+		return pdc_pkt->tx_pkt_handle == tx_pkt_handle;
+	return pdc_pkt->uet_ep == uet_ep;
+}
+
+/*
+ * Retire a PDC that lost un-ACK'ed packets to an abort. Its PSN space now
+ * has holes the peer will never see filled, so the PDC cannot carry traffic
+ * any more. Every packet it tracks is freed, those the abort does not drop
+ * (other endpoints', or other messages') failed up to SES as closing in
+ * error would, and the PDC is closed with the peer: a CLOSE command makes
+ * the target clear all PSNs and free its side. The CLOSE carries no
+ * payload. A PDC that was never established has no peer state to close and
+ * is freed.
  */
 static void uet_pds_pdc_abort(struct uet_instance *uet,
 			      struct uet_pdc *pdc,
-			      struct uet_ep *uet_ep)
+			      struct uet_ep *uet_ep,
+			      uet_pkt_handle_t tx_pkt_handle)
 {
 	struct uet_pdc_pkt *pdc_pkt;
 	struct dlist_entry *tmp;
@@ -4525,8 +4540,8 @@ static void uet_pds_pdc_abort(struct uet_instance *uet,
 			bm_unset(pdc->tx_bm,
 				 (pdc_pkt->psn - pdc->tx_bm_base_psn));
 
-		if ((pdc_pkt->uet_ep != uet_ep) && pdc_pkt->tx_pkt_handle &&
-		    uet->pds.upcall.pds_err)
+		if (!uet_pds_pkt_aborted(pdc_pkt, uet_ep, tx_pkt_handle) &&
+		    pdc_pkt->tx_pkt_handle && uet->pds.upcall.pds_err)
 			uet->pds.upcall.pds_err(pdc_pkt->tx_pkt_handle,
 						UET_PDS_ERR_NONE);
 
@@ -4550,7 +4565,7 @@ static void uet_pds_pdc_abort(struct uet_instance *uet,
 	pdc->tx_bm_base_psn = pdc->next_psn;
 	UET_PDS_UPDATE_PSN(pdc->max_cack_psn, pdc->next_psn - 1);
 
-	UET_PDS_WARN("PDC %u retired by endpoint abort", pdc->pdc_id);
+	UET_PDS_WARN("PDC %u retired by an abort", pdc->pdc_id);
 
 	/* the CLOSE command went with the packets */
 	if (pdc->close_started) {
@@ -4616,6 +4631,60 @@ void uet_pds_ep_abort(struct uet_ep *uet_ep)
 		}
 
 		if (owns_pkts)
-			uet_pds_pdc_abort(uet, pdc, uet_ep);
+			uet_pds_pdc_abort(uet, pdc, uet_ep, NULL);
+	}
+}
+
+void uet_pds_msg_abort(struct uet_ep *uet_ep,
+		       uet_pkt_handle_t tx_pkt_handle,
+		       uint16_t msg_id, bool msg_id_valid)
+{
+	struct uet_instance *uet = uet_ep->uet_domain->uet;
+	struct uet_msgid_map *msgid_map, *mtmp;
+	struct uet_pdc *pdc;
+	struct uet_pdc_pkt *pdc_pkt;
+	struct dlist_entry *tmp;
+	bool owns_pkts;
+
+	PDS_GO();
+
+	uet_pds_rudi_msg_abort(tx_pkt_handle);
+
+	/* a message that never had an id sent nothing */
+	if (!msg_id_valid)
+		return;
+
+	/* the message stops holding its PDC */
+	HASH_ITER(msgid_hh, pds_state.pdc_msgid_ht, msgid_map, mtmp) {
+		if ((msgid_map->uet_ep != uet_ep) ||
+		    (msgid_map->msg_id != msg_id))
+			continue;
+
+		pdc = msgid_map->pdc;
+		if (pdc->active_msg_id_valid &&
+		    (pdc->active_msg_id == msgid_map->msg_id)) {
+			pdc->active_msg_id = 0;
+			pdc->active_msg_id_valid = false;
+		}
+
+		HASH_DELETE(msgid_hh, pds_state.pdc_msgid_ht, msgid_map);
+		free(msgid_map);
+	}
+
+	/* PDCs with un-ACK'ed packets of the message; one whose packets of it
+	 * were all acknowledged has no hole and carries on */
+	dlist_foreach_container_safe(&pds_state.pdc_alloc_head,
+				     struct uet_pdc, pdc, node, tmp) {
+		owns_pkts = false;
+		dlist_foreach_container(&pdc->tx_pkt_list_head,
+					struct uet_pdc_pkt, pdc_pkt, node) {
+			if (pdc_pkt->tx_pkt_handle == tx_pkt_handle) {
+				owns_pkts = true;
+				break;
+			}
+		}
+
+		if (owns_pkts)
+			uet_pds_pdc_abort(uet, pdc, uet_ep, tx_pkt_handle);
 	}
 }

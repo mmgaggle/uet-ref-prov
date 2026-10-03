@@ -7742,6 +7742,85 @@ int uet_ep_abort(uet_ep_handle_t ep_handle)
 	return FI_SUCCESS;
 }
 
+/*
+ * Move the tx ring entry at @idx to the tail, keeping the order of the
+ * entries it passes, so uet_tx_desc_recycle(), which removes the tail, can
+ * retire it.
+ */
+static void uet_tx_desc_ring_move_to_tail(struct uet_ring *ring, size_t idx)
+{
+	struct uet_tx_desc_ring_entry *e = ring->base;
+	struct uet_tx_desc *tx_desc = e[idx].tx_desc;
+	size_t prev;
+
+	while (idx != ring->tail) {
+		prev = (idx == 0) ? (ring->num_entries - 1) : (idx - 1);
+		e[idx].tx_desc = e[prev].tx_desc;
+		idx = prev;
+	}
+	e[ring->tail].tx_desc = tx_desc;
+}
+
+int uet_ep_abort_op(uet_ep_handle_t ep_handle, void *context)
+{
+	struct uet_ep *uet_ep;
+	struct uet_pds *pds;
+	struct uet_ring *ring;
+	struct uet_tx_desc_ring_entry *e;
+	struct uet_tx_desc *tx_desc = NULL;
+	struct uet_av_entry *av_entry;
+	size_t idx;
+
+	uet_ep = (struct uet_ep *) ep_handle;
+	pds = &uet_ep->uet_domain->uet->pds;
+
+	if (pds->downcall.msg_abort == NULL)
+		return -FI_ENOSYS;
+
+	pthread_mutex_lock(&uet_ep->data_lock);
+
+	/* the operation's message, among those still outstanding; one that
+	 * has completed is in the completion queue and is not found here */
+	ring = &uet_ep->tx_ring;
+	e = ring->base;
+	for (idx = ring->tail; idx != ring->head;
+	     idx = (idx + 1 == ring->num_entries) ? 0 : (idx + 1)) {
+		if ((e[idx].tx_desc->context == context) &&
+		    !(e[idx].tx_desc->desc_flags & (UET_TX_DESC_FLAG_READ_RSP |
+						    UET_TX_DESC_FLAG_RTR_REQ))) {
+			tx_desc = e[idx].tx_desc;
+			break;
+		}
+	}
+	if (tx_desc == NULL) {
+		pthread_mutex_unlock(&uet_ep->data_lock);
+		return -FI_ENOENT;
+	}
+
+	/* PDS first: it still refers to the descriptor as a packet handle */
+	pds->downcall.msg_abort(uet_ep, (uet_pkt_handle_t) tx_desc,
+				tx_desc->msg_id,
+				(tx_desc->desc_flags &
+				 UET_TX_DESC_FLAG_MSG_ID_ALLOCATED) != 0);
+
+	/* retire it as completion would, but post nothing */
+	av_entry = (struct uet_av_entry *) tx_desc->dst_addr_handle;
+	if (tx_desc->pds_mode == UET_PDS_MODE_ROD)
+		uet_inc_av_msg_next_tx_seq_num(av_entry);
+	av_entry->num_active_ops--;
+	uet_ep->num_active_sends--;
+
+	if (tx_desc->desc_flags & UET_TX_DESC_FLAG_SYNC_REQ)
+		uet_sync_grp_completion_initiator(tx_desc);
+
+	uet_tx_desc_buf_rtr_list_remove(tx_desc);
+	uet_tx_desc_ring_move_to_tail(ring, idx);
+	uet_tx_desc_recycle(tx_desc, true); /* removes the tail */
+
+	pthread_mutex_unlock(&uet_ep->data_lock);
+	return FI_SUCCESS;
+}
+
 int uet_ep_close(uet_ep_handle_t ep_handle)
 {
 	struct uet_ep *uet_ep;

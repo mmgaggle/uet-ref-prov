@@ -266,6 +266,30 @@ struct uet_ses_to_pds_funcs {
 	 *               being closed
 	 */
 	void (*ep_abort)(struct uet_ep *uet_ep);
+
+	/*
+	 * discard the transmit state of one message, as ep_abort does for
+	 * every message of an endpoint
+	 *   - every packet sent for the message is dropped: it is not
+	 *     retransmitted again, and no response or error is passed up
+	 *     for it
+	 *   - the message stops holding its PDC
+	 *   - a PDC that loses un-ACK'ed packets this way is retired as
+	 *     ep_abort retires it, and the packets of other messages on it
+	 *     fail as closing in error would; RUDI has no PDC, so aborting
+	 *     a RUDI message leaves every other message alone
+	 *   - optional: NULL if the PDS cannot abort
+	 *
+	 * parms:
+	 *      uet_ep        - ptr to uet endpoint struct of the message
+	 *      tx_pkt_handle - handle the message's packets were sent with
+	 *      msg_id        - the message's id
+	 *      msg_id_valid  - false if the message never had an id, and so
+	 *                      sent nothing
+	 */
+	void (*msg_abort)(struct uet_ep *uet_ep,
+			  uet_pkt_handle_t tx_pkt_handle,
+			  uint16_t msg_id, bool msg_id_valid);
 };
 
 struct uet_pds_to_ses_funcs {
