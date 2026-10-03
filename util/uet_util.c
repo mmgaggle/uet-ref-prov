@@ -25,7 +25,12 @@ int uet_gettime(time_t *time_ms)
 {
 	struct timespec s;
 
-	if (clock_gettime(CLOCK_REALTIME, &s)) {
+	/*
+	 * Millisecond resolution is all the callers keep, and this runs on
+	 * every packet.  The coarse clock is a memory read of the kernel's
+	 * tick time, no counter read.
+	 */
+	if (clock_gettime(CLOCK_REALTIME_COARSE, &s)) {
 		*time_ms = 0;
 		return -1;
 	}
