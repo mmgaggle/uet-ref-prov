@@ -204,11 +204,16 @@ void bm_shift_right(struct bitmap *bm, int s)
 	for (i = 0; i < chop_words; i++)
 		bm->bit_arr[bm->bit_arr_len - 1 - i] = 0;
 
-	/* shift the data pointer array */
-	for (i = 0; i < (bm->size - s); i++)
-		bm->data_arr[i] = bm->data_arr[i + s];
-	for (i = (bm->size - s); i < bm->size; i++)
-		bm->data_arr[i] = NULL;
+	/* shift the data pointer array: one move, not a loop, it is the
+	 * largest part of the bitmap and this runs on every ACK */
+	if (s < bm->size) {
+		memmove(bm->data_arr, bm->data_arr + s,
+			(size_t)(bm->size - s) * sizeof(void *));
+		memset(bm->data_arr + (bm->size - s), 0,
+		       (size_t)s * sizeof(void *));
+	} else {
+		memset(bm->data_arr, 0, (size_t)bm->size * sizeof(void *));
+	}
 }
 
 /*
