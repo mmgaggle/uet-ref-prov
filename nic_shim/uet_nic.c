@@ -15,6 +15,14 @@
 #include <net/if_arp.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <linux/netlink.h>
+#include <linux/neighbour.h>
+#include <linux/rtnetlink.h>
 
 #include "uet_api_private.h"
 #include "uet_nic.h"
@@ -110,96 +118,389 @@ int uet_nic_get_ipv6_addr(const char *ifname,
 	return -ENOENT;
 }
 
+/*
+ * IPv4 next-hop resolution over rtnetlink.
+ *
+ * The next hop comes from the route the kernel would use out of the shim's
+ * interface (RTM_GETROUTE with that output interface, which also finds the
+ * route inside a VRF the interface is enslaved to), and its MAC from the
+ * interface's neighbor table (RTM_GETNEIGH). An existing entry is used as
+ * it is, and never deleted. Without a usable one, a datagram to the next
+ * hop out of the interface makes the kernel resolve it by ARP, and the
+ * table is polled until the entry is usable or UET_NH_WAIT_MS (default
+ * 1000) has passed. With UET_NH_WAIT_MS=0 nothing waits: the call returns
+ * -EAGAIN while the resolution runs, and a later call finds the MAC. The
+ * core retries resolution on every post until it succeeds, so a caller of
+ * uet_av_insert() need not wait for a peer that is slow to answer.
+ *
+ * This replaces "ip route get", "arp -d" and "ping", which took a process
+ * each, deleted a good entry first, and waited up to 10 s for an echo
+ * reply from a peer that does not answer ping. Everything here is in local
+ * variables, so threads may resolve at once.
+ */
+#define UET_NH_WAIT_MS_ENV	"UET_NH_WAIT_MS"
+#define UET_NH_WAIT_MS_DEF	1000
+#define UET_NH_PROBE_MS		200	/* a probe at most this often */
+#define UET_NH_POLL_US		1000	/* neighbor table polling interval */
+#define UET_NH_PROBE_PORT	9	/* discard */
+#define UET_NL_BUF		16384
+
+static uint64_t uet_nh_now_ms(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static int uet_nh_wait_ms(void)
+{
+	const char *s = getenv(UET_NH_WAIT_MS_ENV);
+	char *end;
+	long v;
+
+	if (s == NULL || *s == '\0')
+		return UET_NH_WAIT_MS_DEF;
+	v = strtol(s, &end, 10);
+	if (*end != '\0' || v < 0 || v > 60000)
+		return UET_NH_WAIT_MS_DEF;
+	return (int)v;
+}
+
+/*
+ * Send a request on a fresh NETLINK_ROUTE socket and hand every reply
+ * message to cb, until NLMSG_DONE for a dump or the one reply otherwise.
+ * Returns 0, a negative errno from the kernel, or one of the socket's.
+ */
+static int uet_nl_request(struct nlmsghdr *req,
+			  void (*cb)(const struct nlmsghdr *, void *),
+			  void *arg)
+{
+	struct sockaddr_nl sa;
+	char *buf;
+	int fd, rc = 0;
+	bool dump = (req->nlmsg_flags & NLM_F_DUMP) != 0;
+	bool done = false;
+
+	fd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (fd < 0)
+		return -errno;
+
+	memset(&sa, 0, sizeof(sa));
+	sa.nl_family = AF_NETLINK;
+	req->nlmsg_seq = 1;
+	if (sendto(fd, req, req->nlmsg_len, 0, (struct sockaddr *)&sa,
+		   sizeof(sa)) < 0) {
+		rc = -errno;
+		close(fd);
+		return rc;
+	}
+
+	buf = malloc(UET_NL_BUF);
+	if (buf == NULL) {
+		close(fd);
+		return -ENOMEM;
+	}
+
+	while (!done) {
+		ssize_t n = recv(fd, buf, UET_NL_BUF, 0);
+		struct nlmsghdr *h;
+		int len;
+
+		if (n < 0) {
+			if (errno == EINTR)
+				continue;
+			rc = -errno;
+			break;
+		}
+		len = (int)n;
+		for (h = (struct nlmsghdr *)buf; NLMSG_OK(h, len);
+		     h = NLMSG_NEXT(h, len)) {
+			if (h->nlmsg_seq != 1)
+				continue;
+			if (h->nlmsg_type == NLMSG_DONE) {
+				done = true;
+				break;
+			}
+			if (h->nlmsg_type == NLMSG_ERROR) {
+				struct nlmsgerr *e = NLMSG_DATA(h);
+
+				rc = e->error;	/* 0 is an acknowledgement */
+				done = true;
+				break;
+			}
+			cb(h, arg);
+			if (!dump) {
+				done = true;
+				break;
+			}
+		}
+	}
+
+	free(buf);
+	close(fd);
+	return rc;
+}
+
+static void uet_nl_add_attr(struct nlmsghdr *h, unsigned short type,
+			    const void *data, unsigned short len)
+{
+	struct rtattr *rta = (struct rtattr *)
+		((char *)h + NLMSG_ALIGN(h->nlmsg_len));
+
+	rta->rta_type = type;
+	rta->rta_len = RTA_LENGTH(len);
+	memcpy(RTA_DATA(rta), data, len);
+	h->nlmsg_len = NLMSG_ALIGN(h->nlmsg_len) + RTA_ALIGN(rta->rta_len);
+}
+
+struct uet_nl_route {
+	bool found;
+	uint32_t gw;	/* network order, 0 if on-link */
+};
+
+static void uet_nl_route_cb(const struct nlmsghdr *h, void *arg)
+{
+	struct uet_nl_route *r = arg;
+	const struct rtmsg *rtm = NLMSG_DATA(h);
+	const struct rtattr *rta;
+	int len;
+
+	if (h->nlmsg_type != RTM_NEWROUTE || rtm->rtm_family != AF_INET)
+		return;
+	r->found = true;
+	len = (int)RTM_PAYLOAD(h);
+	for (rta = RTM_RTA(rtm); RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if (rta->rta_type == RTA_GATEWAY &&
+		    RTA_PAYLOAD(rta) == sizeof(uint32_t))
+			memcpy(&r->gw, RTA_DATA(rta), sizeof(uint32_t));
+	}
+}
+
+/* the next hop out of @ifindex to @dst (network order), as the kernel
+ * routes it */
+static int uet_nl_next_hop(int ifindex, uint32_t dst, uint32_t *nh)
+{
+	struct {
+		struct nlmsghdr h;
+		struct rtmsg r;
+		char attrs[64];
+	} req;
+	struct uet_nl_route route = { 0 };
+	int rc;
+
+	memset(&req, 0, sizeof(req));
+	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct rtmsg));
+	req.h.nlmsg_type = RTM_GETROUTE;
+	req.h.nlmsg_flags = NLM_F_REQUEST;
+	req.r.rtm_family = AF_INET;
+	req.r.rtm_dst_len = 32;
+	uet_nl_add_attr(&req.h, RTA_DST, &dst, sizeof(dst));
+	uet_nl_add_attr(&req.h, RTA_OIF, &ifindex, sizeof(ifindex));
+
+	rc = uet_nl_request(&req.h, uet_nl_route_cb, &route);
+	if (rc != 0)
+		return rc;
+	if (!route.found)
+		return -ENETUNREACH;
+	*nh = route.gw != 0 ? route.gw : dst;
+	return 0;
+}
+
+struct uet_nl_neigh {
+	int ifindex;
+	uint32_t ip;	/* network order */
+	bool found;
+	uint16_t state;
+	uint8_t mac[ETH_ALEN];
+	bool has_mac;
+};
+
+static void uet_nl_neigh_cb(const struct nlmsghdr *h, void *arg)
+{
+	struct uet_nl_neigh *q = arg;
+	const struct ndmsg *ndm = NLMSG_DATA(h);
+	const struct rtattr *rta;
+	bool match = false, has_mac = false;
+	uint8_t mac[ETH_ALEN];
+	int len;
+
+	if (h->nlmsg_type != RTM_NEWNEIGH || ndm->ndm_family != AF_INET ||
+	    ndm->ndm_ifindex != q->ifindex)
+		return;
+	len = (int)(h->nlmsg_len - NLMSG_LENGTH(sizeof(*ndm)));
+	for (rta = (const struct rtattr *)((const char *)ndm +
+					   NLMSG_ALIGN(sizeof(*ndm)));
+	     RTA_OK(rta, len); rta = RTA_NEXT(rta, len)) {
+		if (rta->rta_type == NDA_DST &&
+		    RTA_PAYLOAD(rta) == sizeof(uint32_t))
+			match = memcmp(RTA_DATA(rta), &q->ip,
+				       sizeof(uint32_t)) == 0;
+		else if (rta->rta_type == NDA_LLADDR &&
+			 RTA_PAYLOAD(rta) == ETH_ALEN) {
+			memcpy(mac, RTA_DATA(rta), ETH_ALEN);
+			has_mac = true;
+		}
+	}
+	if (!match)
+		return;
+	q->found = true;
+	q->state = ndm->ndm_state;
+	q->has_mac = has_mac;
+	if (has_mac)
+		memcpy(q->mac, mac, ETH_ALEN);
+}
+
+/* the neighbor entry of @ip (network order) on @ifindex */
+static int uet_nl_neighbor(struct uet_nl_neigh *q)
+{
+	struct {
+		struct nlmsghdr h;
+		struct ndmsg n;
+	} req;
+
+	memset(&req, 0, sizeof(req));
+	req.h.nlmsg_len = NLMSG_LENGTH(sizeof(struct ndmsg));
+	req.h.nlmsg_type = RTM_GETNEIGH;
+	req.h.nlmsg_flags = NLM_F_REQUEST | NLM_F_DUMP;
+	req.n.ndm_family = AF_INET;
+	req.n.ndm_ifindex = q->ifindex;	/* a filter, where the kernel has it */
+	q->found = false;
+	return uet_nl_request(&req.h, uet_nl_neigh_cb, q);
+}
+
+static bool uet_nl_neigh_usable(const struct uet_nl_neigh *q)
+{
+	static const uint8_t zero[ETH_ALEN];
+
+	return q->found && q->has_mac &&
+	       (q->state & (NUD_REACHABLE | NUD_STALE | NUD_DELAY |
+			    NUD_PROBE | NUD_PERMANENT | NUD_NOARP)) != 0 &&
+	       memcmp(q->mac, zero, ETH_ALEN) != 0;
+}
+
+/*
+ * Make the kernel resolve @nh (network order) on @ifname: a datagram to it,
+ * bound to the interface (a VRF slave too). It goes once the neighbor is
+ * known; the kernel asks by ARP first. At most one per UET_NH_PROBE_MS for
+ * a destination, across threads.
+ */
+static void uet_nh_probe(const char *ifname, int ifindex, uint32_t nh)
+{
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static struct { uint32_t nh; uint64_t at; } recent[16];
+	static unsigned next;
+	struct sockaddr_in sin;
+	uint64_t now = uet_nh_now_ms();
+	bool skip = false;
+	unsigned i;
+	int fd;
+
+	pthread_mutex_lock(&lock);
+	for (i = 0; i < 16; i++) {
+		if (recent[i].nh == nh && recent[i].at != 0 &&
+		    now - recent[i].at < UET_NH_PROBE_MS) {
+			skip = true;
+			break;
+		}
+	}
+	if (!skip) {
+		for (i = 0; i < 16 && recent[i].nh != nh; i++)
+			;
+		if (i == 16)
+			i = next++ % 16;
+		recent[i].nh = nh;
+		recent[i].at = now;
+	}
+	pthread_mutex_unlock(&lock);
+	if (skip)
+		return;
+
+	fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	if (fd < 0)
+		return;
+	/* SO_BINDTODEVICE needs CAP_NET_RAW, which the raw socket needs as
+	 * well; IP_UNICAST_IF picks the interface without it */
+	if (setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname,
+		       strlen(ifname) + 1) != 0) {
+		uint32_t idx = htonl((uint32_t)ifindex);
+
+		(void)setsockopt(fd, IPPROTO_IP, IP_UNICAST_IF, &idx,
+				 sizeof(idx));
+	}
+	memset(&sin, 0, sizeof(sin));
+	sin.sin_family = AF_INET;
+	sin.sin_port = htons(UET_NH_PROBE_PORT);
+	sin.sin_addr.s_addr = nh;
+	(void)sendto(fd, NULL, 0, MSG_DONTWAIT, (struct sockaddr *)&sin,
+		     sizeof(sin));
+	close(fd);
+}
+
 /* resolve next-hop info for ipv4 destination address */
 int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 			    int sock_fd,
 			    uint32_t dst_ip,
 			    uint8_t *mac)
 {
-	char sys_cmd[UET_MAX_SYS_CMD_OCTETS];
-	int i, rc;
-	uint32_t net_order;
-	FILE *cmd_stream;
-	struct in_addr nh_ipv4;
-	struct arpreq areq;
-	struct sockaddr_in *sin;
-	uint8_t invalid_mac[ETH_ALEN];
+	char dst_str[INET_ADDRSTRLEN], nh_str[INET_ADDRSTRLEN];
+	struct uet_nl_neigh q;
+	uint32_t dst = htonl(dst_ip), nh;
+	uint64_t deadline;
+	int ifindex, wait_ms, rc;
 
-	/* convert ipv4 addr to string */
-	net_order = htonl(dst_ip);
-	inet_ntop(AF_INET, (char *)&net_order, nic->dst_ip_addr_str,
-		  INET_ADDRSTRLEN);
+	(void)sock_fd;
 
-	/* find next-hop ipv4 address */
-	strcpy(sys_cmd, "ip route get to ");
-	strcat(sys_cmd, nic->dst_ip_addr_str);
-	strcat(sys_cmd, " oif ");
-	strcat(sys_cmd, nic->ifname);
-	cmd_stream = popen(sys_cmd, "r");
-	if (cmd_stream == NULL) {
-		UET_API_PRINT_ERRNO("popen");
-		UET_API_ERR("Error getting next-hop IP address");
-		return -EIO;
+	ifindex = (int)if_nametoindex(nic->ifname);
+	if (ifindex == 0) {
+		UET_API_ERR("Unknown interface %s", nic->ifname);
+		return -ENODEV;
 	}
-	for (i = 0; i < INET_ADDRSTRLEN; i++) {
-		nic->nh_ip_addr_str[i] = getc(cmd_stream);
-		if (isspace((int)nic->nh_ip_addr_str[i])) {
-			nic->nh_ip_addr_str[i] = '\0';
-			break;
+
+	inet_ntop(AF_INET, &dst, dst_str, sizeof(dst_str));
+	rc = uet_nl_next_hop(ifindex, dst, &nh);
+	if (rc != 0) {
+		UET_API_ERR("No route to %s out of %s: %s", dst_str,
+			    nic->ifname, strerror(-rc));
+		return -ENETUNREACH;
+	}
+	inet_ntop(AF_INET, &nh, nh_str, sizeof(nh_str));
+
+	memset(&q, 0, sizeof(q));
+	q.ifindex = ifindex;
+	q.ip = nh;
+	wait_ms = uet_nh_wait_ms();
+	deadline = uet_nh_now_ms() + (uint64_t)wait_ms;
+	for (;;) {
+		rc = uet_nl_neighbor(&q);
+		if (rc != 0) {
+			UET_API_ERR("Reading the neighbor table: %s",
+				    strerror(-rc));
+			return -EIO;
 		}
+		if (uet_nl_neigh_usable(&q))
+			break;
+		/* a failed entry is asked again: the peer may be back */
+		uet_nh_probe(nic->ifname, ifindex, nh);
+		if (wait_ms == 0)
+			return -EAGAIN;
+		if (uet_nh_now_ms() >= deadline) {
+			UET_API_ERR("Unable to resolve next-hop %s of %s",
+				    nh_str, dst_str);
+			return -ENETUNREACH;
+		}
+		usleep(UET_NH_POLL_US);
 	}
-	if (i == INET_ADDRSTRLEN) {
-		UET_API_ERR("Error parsing next-hop IP address");
-		pclose(cmd_stream);
-		return -EIO;
-	}
-	inet_pton(AF_INET, nic->nh_ip_addr_str, &nh_ipv4);
-	pclose(cmd_stream);
 
-	/* delete any entry for next-hop already in arp cache */
-	strcpy(sys_cmd, "arp -d ");
-	strcat(sys_cmd, nic->nh_ip_addr_str);
-	strcat(sys_cmd, " 2> /dev/null 1> /dev/null");
-	system(sys_cmd);
-
-	/* ping next hop to load arp cache using our interface */
-	strcpy(sys_cmd, "ping -c 1 -I ");
-	strcat(sys_cmd, nic->ifname);
-	strcat(sys_cmd, " ");
-	strcat(sys_cmd, nic->nh_ip_addr_str);
-	strcat(sys_cmd, " 2> /dev/null 1> /dev/null");
-	system(sys_cmd);
-
-	/* read next-hop mac address from arp cache */
-	memset(&areq, 0, sizeof(areq));
-	sin = (struct sockaddr_in *)&areq.arp_pa;
-	sin->sin_family = AF_INET;
-	sin->sin_port = nic->uet_ipproto;
-	sin->sin_addr = nh_ipv4;
-	sin = (struct sockaddr_in *)&areq.arp_ha;
-	sin->sin_family = ARPHRD_ETHER;
-	strcpy(areq.arp_dev, nic->ifname);
-	if (ioctl(sock_fd, SIOCGARP, (caddr_t)&areq) < 0) {
-		UET_API_PRINT_ERRNO("socket ioctl");
-		UET_API_ERR("Error getting ARP entry");
-		return -EIO;
-	}
-	memcpy(mac, areq.arp_ha.sa_data, ETH_ALEN);
-
-	rc = 0;
-	memset(invalid_mac, 0, ETH_ALEN);
-	if (memcmp(mac, invalid_mac, ETH_ALEN) == 0) {
-		UET_API_ERR("Unable to resolve next-hop MAC addr");
-		rc = -ENETUNREACH;
-	}
+	memcpy(mac, q.mac, ETH_ALEN);
 
 	printf("Next-Hop Address Resolution\n");
-	printf("  Destination IPv4 Addr: %s\n", nic->dst_ip_addr_str);
-	printf("  Next-Hop IPv4 Addr:    %s\n", nic->nh_ip_addr_str);
+	printf("  Destination IPv4 Addr: %s\n", dst_str);
+	printf("  Next-Hop IPv4 Addr:    %s\n", nh_str);
 	printf("  Next-Hop MAC Addr:     ");
 	uet_print_mac_addr(mac);
 
-	return rc;
+	return 0;
 }
 
 /* resolve next-hop info for ipv6 destination address */

@@ -92,10 +92,15 @@ passed between hosts as is. `fi_av_insert()` takes the same bytes.
 | 12-15 | initiator id, big endian |
 | 16-31 | IPv4 address in network order in bytes 16-19, then zeros |
 
-The first time a peer is inserted, the core resolves its next hop. It
-runs `ip route get`, `arp -d` and `ping` through `system()`, and prints
-the result to stdout. Later insertions of the same address reuse that
-entry.
+The first time a peer is inserted, the core resolves its next hop over
+rtnetlink: the route out of the interface (inside its VRF, if it is in
+one), then the neighbor table, and prints the result to stdout. Without
+a usable neighbor entry, a datagram to the next hop makes the kernel
+resolve it by ARP, and the table is polled for up to `UET_NH_WAIT_MS`
+(default 1000) milliseconds. With `UET_NH_WAIT_MS=0` the insert returns
+at once and a write gets `-FI_EAGAIN` until the peer has answered. A
+peer that never answers fails the write with `-FI_ENETUNREACH`. Later
+insertions of the same address reuse that entry.
 
 ## Memory registration
 
