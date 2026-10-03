@@ -127,8 +127,28 @@ insertions of the same address reuse that entry.
   completion, so it stops retransmitting. The core counts such packets
   (`uet_get_target_stats()`). A RUDI write can be retransmitted after it
   has completed, and a copy can arrive late, after the target has
-  reused its window: a target must close the region (or at least
-  disable it) before it reuses the memory, and register it again.
+  reused its window: a target must give the region a new key (or close
+  it) before it reuses the memory.
+* `fi_control(&mr->fid, FI_UET_MR_REKEY, &key)`, with
+  `FI_UET_MR_REKEY` = `FI_PROV_SPECIFIC | 0x554b` and `uint64_t key`
+  (or NULL), gives the region a new key, returned in `key` and by
+  `fi_mr_key()` from then on. The old key is dead when the call
+  returns, as a closed region's is, and is never handed out again; the
+  region keeps its memory, registration and binding. This is the way
+  to re-key a window per request: it costs one call into the core (or
+  one command to a rocm-ernic device) and holds nothing, where
+  `fi_close()` and `fi_mr_reg()` re-pin the memory and, over
+  rocm-ernic, hold a device entry for its 6 s quarantine each time.
+  It returns `-FI_ENOSYS` where the core cannot (a rocm-ernic device
+  without the REKEY command); close and register again then.
+
+  ```c
+  #define FI_UET_MR_REKEY ((int)(FI_PROV_SPECIFIC | 0x554bU))
+  uint64_t key;
+  int ret = fi_control(&mr->fid, FI_UET_MR_REKEY, &key);
+  if (ret == -FI_ENOSYS)
+      /* fi_close(&mr->fid), fi_mr_reg() again */;
+  ```
 * Remote addresses are offsets into the region. `FI_MR_VIRT_ADDR` is
   not set, so a writer addresses byte `n` of a window as `n`. A consumer
   that computes the remote address as token base + offset must use base

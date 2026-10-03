@@ -224,6 +224,28 @@ av_race() {
 	result $rc "fi_av_insert racing inserts, a cut-off and dead peers"
 }
 
+# FI_UET_MR_REKEY: the target gives its window a new key between two
+# writes. A write with the old key fails and lands nothing; one with the
+# new key lands. The target times the rotation against closing and
+# registering a buffer again.
+rekey() {
+	local A K B S rc=0 len=$((4 << 20)) d=$TMP/rekey
+	rm -rf "$d" "$TMP/addr"
+	mkdir -p "$d"
+	inns ofi-a "$DIR/test_rma" -o "$TMP/addr" -t 60 rekey-target "$len" \
+		"$d" > "$TMP/target.log" 2>&1 &
+	local tpid=$!
+	wait_file "$TMP/addr" || { result 1 "rekey (target)"; return; }
+	read -r A K B S < "$TMP/addr"
+	inns ofi-b "$DIR/test_rma" -t 60 rekey-write "$A" "$K" "$B" "$len" \
+		"$d" > "$TMP/w1.log" 2>&1 || rc=1
+	wait $tpid || rc=1
+	grep -a -h "^REKEY\|^WROTE\|^STALE\|^FRESH\|^FAILED\|^TIMEOUT\|^MISMATCH\|^completion error" \
+		"$TMP"/w1.log "$TMP"/target.log | sed 's/^/      /'
+	rm -f "$TMP"/w*.log
+	result $rc "FI_UET_MR_REKEY: the old key is dead at once, the new one works"
+}
+
 run() {
 	echo "== FI_PROVIDER_PATH=$DIR fi_info -p uet -v (in ofi-a)"
 	sudo ip netns exec ofi-a env FI_PROVIDER_PATH="$DIR" fi_info -p uet -v
@@ -240,6 +262,7 @@ run() {
 	bad_key
 	mt_insert
 	av_race
+	rekey
 	[ $FAILED = 0 ] && echo "all passed" || echo "some failed"
 	return $FAILED
 }

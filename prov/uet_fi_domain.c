@@ -116,9 +116,18 @@ static int uetfi_mr_bind(struct fid *fid, struct fid *bfid, uint64_t flags)
 static int uetfi_mr_control(struct fid *fid, int command, void *arg)
 {
 	struct uetfi_mr *mr = container_of(fid, struct uetfi_mr, mr_fid.fid);
+	uint64_t key;
 	int ret;
 
-	(void) arg;
+	if (command == FI_UET_MR_REKEY) {
+		ret = uet_mr_rekey(mr->h, &key);
+		if (ret)
+			return ret;
+		mr->mr_fid.key = key;
+		if (arg)
+			*(uint64_t *) arg = key;
+		return 0;
+	}
 	if (command != FI_ENABLE)
 		return -FI_ENOSYS;
 	/* an unbound region is enabled along with the domain's endpoint */

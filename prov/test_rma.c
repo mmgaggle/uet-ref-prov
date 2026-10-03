@@ -52,6 +52,20 @@
  *	must each fail at once, and inserting the subnet's broadcast address
  *	must not wait for ARP
  *
+ *   test_rma [opts] -o file rekey-target <size> <dir>
+ *	a window of <size> bytes, as target lends it; once a writer has
+ *	filled it and signalled, zero it and give it a new key with
+ *	FI_UET_MR_REKEY (into <dir>/key), timing that against closing and
+ *	registering a buffer of the same size again. Then wait for another
+ *	signal: the first half of the window, which the writer writes with
+ *	the old key, must still be zero, and the second half, written with
+ *	the new key, must hold the pattern
+ *
+ *   test_rma [opts] rekey-write <addr-hex> <key-hex> <base> <size> <dir>
+ *	the writer of rekey-target: fill the window and signal, wait for
+ *	<dir>/key, write the first half with the old key, which must fail,
+ *	then the second half with the new key, and signal with it
+ *
  * options:
  *   -i ifname   netdev (hints->domain_attr->name; default: $UET_IFNAME)
  *   -o file     target: also write "addr key base size" to file
@@ -98,6 +112,7 @@
 #define FI_PROV_SPECIFIC (1U << 31)
 #endif
 #define FI_UET_OPT_CLOSE_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5545U))
+#define FI_UET_MR_REKEY ((int)(FI_PROV_SPECIFIC | 0x554bU))
 
 /* whether fi_close() of the endpoint discards its writes */
 static bool close_discards(struct fid_ep *ep)
@@ -953,6 +968,214 @@ static int run_avrace(const struct opts *o, const char *addr_hex,
 	return rc ? rc : ret;
 }
 
+/* poll the CQ until 'want' signals have arrived in all, or the deadline */
+static int wait_signals(struct res *r, int *signals, int want,
+			double deadline)
+{
+	struct fi_cq_data_entry ce[16];
+	ssize_t n, i;
+
+	while (*signals < want) {
+		n = fi_cq_read(r->cq, ce, 16);
+		if (n == -FI_EAVAIL)
+			report_err(r->cq);
+		for (i = 0; i < n; i++)
+			if (ce[i].flags & FI_REMOTE_CQ_DATA)
+				(*signals)++;
+		if (now() > deadline)
+			return -FI_ETIMEDOUT;
+	}
+	return 0;
+}
+
+static int run_rekey_target(const struct opts *o, size_t size,
+			    const char *dir)
+{
+	const int n_rekey = 1000, n_rereg = 100;
+	struct res r;
+	struct fid_mr *mr, *smr;
+	char h[2 * MAX_ADDR + 1], path[512], tmp[512];
+	uint8_t *win, *scratch, *expect;
+	uint64_t base, key0, key = 0;
+	size_t half = size / 2, first, nz = 0, bad, i;
+	double t0, t_rekey, t_rereg, deadline;
+	int signals = 0, ret;
+	FILE *f;
+
+	memset(&r, 0, sizeof(r));
+	CHECK(setup(&r, o, FI_CQ_FORMAT_DATA));
+	win = aligned_alloc(4096, (size + 4095) & ~(size_t) 4095);
+	scratch = aligned_alloc(4096, (size + 4095) & ~(size_t) 4095);
+	expect = malloc(size);
+	if (!win || !scratch || !expect)
+		return -FI_ENOMEM;
+	memset(win, 0, size);
+	memset(scratch, 0, size);
+	for (i = 0; i < size; i++)
+		expect[i] = pattern(i);
+	CHECK(reg(&r, win, size, FI_WRITE | FI_REMOTE_WRITE, &mr));
+	key0 = fi_mr_key(mr);
+	base = (r.info->domain_attr->mr_mode & FI_MR_VIRT_ADDR) ?
+	       (uintptr_t) win : 0;
+	hex(r.addr, r.addrlen, h);
+	if (o->outfile) {
+		f = fopen(o->outfile, "w");
+		if (!f)
+			return -errno;
+		fprintf(f, "%s %016" PRIx64 " %" PRIu64 " %zu\n", h, key0,
+			base, size);
+		fclose(f);
+	}
+
+	/* the writer fills the window with the first key */
+	if (wait_signals(&r, &signals, 1, now() + o->timeout)) {
+		printf("TIMEOUT waiting for the first fill\n");
+		return 1;
+	}
+	if (count_bad(win, expect, size, &first)) {
+		printf("MISMATCH after the first fill, at %zu\n", first);
+		return 1;
+	}
+	memset(win, 0, size);
+
+	/* a new key, many times over, and the same by closing and
+	 * registering a buffer again */
+	t0 = now();
+	for (i = 0; i < (size_t) n_rekey; i++) {
+		ret = fi_control(&mr->fid, FI_UET_MR_REKEY, &key);
+		if (ret) {
+			printf("FAILED FI_UET_MR_REKEY: %s\n",
+			       fi_strerror(-ret));
+			return 1;
+		}
+	}
+	t_rekey = (now() - t0) / n_rekey;
+	if (key == key0 || key != fi_mr_key(mr)) {
+		printf("FAILED the key is %016" PRIx64 ", fi_mr_key() %016"
+		       PRIx64 "\n", key, fi_mr_key(mr));
+		return 1;
+	}
+	CHECK(reg(&r, scratch, size, FI_WRITE | FI_REMOTE_WRITE, &smr));
+	t0 = now();
+	for (i = 0; i < (size_t) n_rereg; i++) {
+		CHECK(fi_close(&smr->fid));
+		CHECK(reg(&r, scratch, size, FI_WRITE | FI_REMOTE_WRITE,
+			  &smr));
+	}
+	t_rereg = (now() - t0) / n_rereg;
+	CHECK(fi_close(&smr->fid));
+	printf("REKEY %016" PRIx64 " to %016" PRIx64 " in %d rotations, "
+	       "%.2f us each; fi_close() and fi_mr_reg() of %zu bytes: "
+	       "%.2f us\n", key0, key, n_rekey, t_rekey * 1e6, size,
+	       t_rereg * 1e6);
+	fflush(stdout);
+
+	snprintf(tmp, sizeof(tmp), "%s/key.tmp", dir);
+	snprintf(path, sizeof(path), "%s/key", dir);
+	f = fopen(tmp, "w");
+	if (!f)
+		return 1;
+	fprintf(f, "%016" PRIx64 "\n", key);
+	fclose(f);
+	rename(tmp, path);
+
+	if (wait_signals(&r, &signals, 2, now() + o->timeout)) {
+		printf("TIMEOUT waiting for the second signal\n");
+		return 1;
+	}
+	for (i = 0; i < half; i++)
+		nz += win[i] != 0;
+	bad = count_bad(win + half, expect + half, size - half, &first);
+	printf("REKEYED WINDOW %zu of %zu bytes written with the old key "
+	       "landed; %zu of %zu written with the new key wrong\n", nz,
+	       half, bad, size - half);
+
+	/* keep answering while the writer finishes */
+	deadline = now() + 1;
+	while (now() < deadline)
+		fi_cq_read(r.cq, NULL, 0);
+	CHECK(fi_close(&mr->fid));
+	free(expect);
+	free(scratch);
+	free(win);
+	ret = teardown(&r);
+	return nz || bad ? 1 : ret;
+}
+
+static int run_rekey_write(const struct opts *o, const char *addr_hex,
+			   const char *key_hex, uint64_t base, size_t size,
+			   const char *dir)
+{
+	struct res r;
+	struct fi_context2 ctx[2];
+	uint8_t peer_addr[MAX_ADDR], *src;
+	uint64_t key = strtoull(key_hex, NULL, 16), key2 = 0;
+	size_t peer_len, half = size / 2, i;
+	fi_addr_t peer;
+	char path[512];
+	double t0;
+	int ret, signals = 0;
+	FILE *f;
+
+	if (unhex(addr_hex, peer_addr, sizeof(peer_addr), &peer_len))
+		return 2;
+	memset(&r, 0, sizeof(r));
+	CHECK(setup(&r, o, FI_CQ_FORMAT_DATA));
+	src = malloc(size);
+	if (!src)
+		return -FI_ENOMEM;
+	for (i = 0; i < size; i++)
+		src[i] = pattern(i);
+	if (fi_av_insert(r.av, peer_addr, 1, &peer, 0, NULL) != 1)
+		return 1;
+
+	t0 = now();
+	CHECK(fi_write(r.ep, src, size, NULL, peer, base, key, &ctx[0]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	CHECK(fi_writedata(r.ep, NULL, 0, NULL, 1, peer, base, key, &ctx[1]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	printf("WROTE %zu bytes with the first key and signalled\n", size);
+	fflush(stdout);
+
+	snprintf(path, sizeof(path), "%s/key", dir);
+	while (!(f = fopen(path, "r"))) {
+		if (now() - t0 > o->timeout) {
+			printf("TIMEOUT waiting for the new key\n");
+			return 1;
+		}
+		usleep(10000);
+	}
+	if (fscanf(f, "%" SCNx64, &key2) != 1)
+		key2 = 0;
+	fclose(f);
+
+	/* the old key is dead: this fails, and lands nothing */
+	t0 = now();
+	ret = fi_write(r.ep, src, half, NULL, peer, base, key, &ctx[0]);
+	if (!ret)
+		ret = poll_tx(&r, 1, t0 + o->timeout, &signals);
+	printf("STALE write of %zu bytes with the old key: %s after %.1f "
+	       "ms\n", half, ret ? fi_strerror(-ret) : "COMPLETED",
+	       (now() - t0) * 1e3);
+	if (!ret || ret == -FI_ETIMEDOUT)
+		return 1;
+
+	/* the new one works */
+	t0 = now();
+	CHECK(fi_write(r.ep, src + half, size - half, NULL, peer, base + half,
+		       key2, &ctx[0]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	CHECK(fi_writedata(r.ep, NULL, 0, NULL, 2, peer, base, key2,
+			   &ctx[1]));
+	CHECK(poll_tx(&r, 1, t0 + o->timeout, &signals));
+	printf("FRESH write of %zu bytes with the new key %016" PRIx64
+	       " and signalled\n", size - half, key2);
+
+	CHECK(fi_av_remove(r.av, &peer, 1, 0));
+	free(src);
+	return teardown(&r);
+}
+
 static int run_pair(const struct opts *o, size_t size, const char *peerfile)
 {
 	struct res r;
@@ -1308,6 +1531,10 @@ static void usage(void)
 		"<key-hex> <base> <len> <dead-addr-hex>\n"
 		"       test_rma [-i ifname] [-c chunk] [-q depth] avrace "
 		"<addr-hex> <key-hex> <base> <len> <dead-addr-hex>\n"
+		"       test_rma [-i ifname] -o file rekey-target <size> "
+		"<dir>\n"
+		"       test_rma [-i ifname] rekey-write <addr-hex> <key-hex> "
+		"<base> <size> <dir>\n"
 		"       (-m: FI_AV_MAP, -t secs: timeout)\n");
 }
 
@@ -1359,6 +1586,13 @@ int main(int argc, char **argv)
 	else if (argc == 6 && !strcmp(argv[0], "mt"))
 		ret = run_mt(&o, argv[1], argv[2], strtoull(argv[3], NULL, 0),
 			     strtoull(argv[4], NULL, 0), argv[5]);
+	else if (argc == 3 && !strcmp(argv[0], "rekey-target"))
+		ret = run_rekey_target(&o, strtoull(argv[1], NULL, 0),
+				       argv[2]);
+	else if (argc == 6 && !strcmp(argv[0], "rekey-write"))
+		ret = run_rekey_write(&o, argv[1], argv[2],
+				      strtoull(argv[3], NULL, 0),
+				      strtoull(argv[4], NULL, 0), argv[5]);
 	else if (argc == 6 && !strcmp(argv[0], "avrace"))
 		ret = run_avrace(&o, argv[1], argv[2],
 				 strtoull(argv[3], NULL, 0),

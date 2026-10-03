@@ -75,6 +75,19 @@
 #define FI_UET_OPT_CLOSE_DISCARDS ((int)(FI_PROV_SPECIFIC | 0x5545U))
 
 /*
+ * fi_control(&mr->fid, FI_UET_MR_REKEY, &key) with uint64_t key (or NULL):
+ * give the region a new key, returned in key and by fi_mr_key() from then
+ * on. The old key is dead when the call returns, as if the region had been
+ * closed: a write with it lands nothing and fails at the initiator, also a
+ * late duplicate of one that completed, and a write under way with it
+ * fails at its next packet. The region keeps its memory, registration and
+ * binding, so this costs far less than fi_close() and fi_mr_reg(), and
+ * uses up nothing. -FI_ENOSYS from a core that cannot (a rocm-ernic device
+ * without the REKEY command): close and register again instead.
+ */
+#define FI_UET_MR_REKEY ((int)(FI_PROV_SPECIFIC | 0x554bU))
+
+/*
  * Endpoint address, as returned by fi_getname() and accepted by
  * fi_av_insert(). It is self-contained and byte-order independent:
  *
