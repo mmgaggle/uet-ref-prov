@@ -29,7 +29,14 @@
 
 #define UET_DEFAULT_TC          0
 #define UET_PDS_MPR_GRANULARITY 128U
-#define UET_DEFAULT_MP_RANGE    128U
+/*
+ * The window in packets: the size of the bitmaps and what the MPR field
+ * offers the peer.  The default suits a wire that queues about 1000
+ * frames.  UET_PDS_MP_RANGE sets it, a multiple of 128 up to 32640, for a
+ * wire that holds more, such as a NIC with a 4096-descriptor ring.
+ */
+static uint32_t pds_mp_range = 128U;
+#define UET_DEFAULT_MP_RANGE    pds_mp_range
 #define UET_DEFAULT_MPR         (UET_DEFAULT_MP_RANGE / UET_PDS_MPR_GRANULARITY)
 #define UET_DEFAULT_ENTROPY     0x4242
 
@@ -1520,6 +1527,20 @@ int uet_pds_initialize(struct uet_instance *uet)
 	if (getenv("UET_NEW_PDC_TIME")) {
 		pds_new_pdc_time_ms =
 			strtoul(getenv("UET_NEW_PDC_TIME"), NULL, 10);
+	}
+
+	/* the window in packets, see pds_mp_range */
+	if (getenv("UET_PDS_MP_RANGE")) {
+		unsigned long v = strtoul(getenv("UET_PDS_MP_RANGE"), NULL, 10);
+
+		if ((v == 0) || (v % UET_PDS_MPR_GRANULARITY) ||
+		    (v > (255UL * UET_PDS_MPR_GRANULARITY))) {
+			UET_PDS_WARN("UET_PDS_MP_RANGE=%lu is not a multiple of "
+				     "%u up to %u", v, UET_PDS_MPR_GRANULARITY,
+				     255U * UET_PDS_MPR_GRANULARITY);
+			return -EINVAL;
+		}
+		pds_mp_range = (uint32_t)v;
 	}
 
 	/* secure PDC establishment method */
