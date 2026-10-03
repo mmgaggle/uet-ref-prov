@@ -586,6 +586,7 @@ struct uet_instance {
 	uint32_t msg_rndz_size;           /* threshold for message rendezvous */
 	uint32_t tag_rndz_size;        /* threshold for tagged msg rendezvous */
 	time_t idle_rx_msg_timeout;           /* timeout for partial rx msg's */
+	_Atomic uint64_t dead_key_pkts;    /* packets naming no enabled region */
 	time_t idle_dsend_msg_timeout;     /* timeout for deferred send msg's */
 	time_t idle_rtr_msg_timeout;        /* timeout for buffered rtr msg's */
 	time_t max_rx_sync_grp_lifetime;   /* max lifetime for rx sync groups */
@@ -609,6 +610,7 @@ struct uet_mr_desc_alloc_cb {
 #define UET_MR_DESC_AVAILABLE 0x00                            /* state values */
 #define UET_MR_DESC_ALLOCATED 0x01
 	uint8_t *state;                              /* dynamically allocated */
+	uint32_t *gen;  /* generation of each index's provider-assigned key */
 };
 
 /* domain control block */

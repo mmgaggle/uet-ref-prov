@@ -118,7 +118,17 @@ insertions of the same address reuse that entry.
 
 * Keys are chosen by the provider and are 64 bits (`mr_key_size` 8).
   The key is the UET memory key: bit 63 `IDEMPOTENT_SAFE`, bit 48 marks
-  a provider-assigned key, and the low bits are the region index.
+  a provider-assigned key, bits 0:23 are the region index and bits 24:47
+  a generation, new each time the index is used again. A region
+  registered anew therefore never gets the key of one that was closed.
+* A write naming a key that no enabled region has (closed, disabled, or
+  never registered) is dropped: nothing is placed, the target keeps no
+  state for it and reports nothing, and the initiator gets an error
+  completion, so it stops retransmitting. The core counts such packets
+  (`uet_get_target_stats()`). A RUDI write can be retransmitted after it
+  has completed, and a copy can arrive late, after the target has
+  reused its window: a target must close the region (or at least
+  disable it) before it reuses the memory, and register it again.
 * Remote addresses are offsets into the region. `FI_MR_VIRT_ADDR` is
   not set, so a writer addresses byte `n` of a window as `n`. A consumer
   that computes the remote address as token base + offset must use base

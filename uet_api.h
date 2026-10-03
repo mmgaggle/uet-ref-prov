@@ -62,6 +62,17 @@
  */
 #define UET_MR_KEY_VENDOR_PROV_SPACE    0x0001000000000000ULL /* bit 48 */
 
+/*
+ * A provider-assigned key in the standard format carries the region's
+ * index in RKEY bits 0:23 and a generation in bits 24:47, bumped each time
+ * the index is assigned again. So a region registered anew never gets the
+ * key of one that was closed, and a late packet naming the old key, such
+ * as a delayed duplicate of a RUDI write, finds no region. The optimized
+ * format has no room for one: its key is the index alone.
+ */
+#define UET_MR_KEY_PROV_INDEX_BITS      24
+#define UET_MR_KEY_PROV_INDEX_MASK      0x0000000000ffffffULL
+
 /* flags for uet_mr_reg() / uet_mr_regv() / uet_mr_reg_job() */
 #define UET_MR_FLAG_USER_KEY            (1ULL << 0)  /* user-assigned */
 
@@ -197,6 +208,23 @@ struct uet_wire_info {
  *   -FI_EINVAL for a bad handle or a NULL info
  */
 int uet_get_wire_info(uet_handle_t handle, struct uet_wire_info *info);
+
+/* what an instance did as a target */
+struct uet_target_stats {
+	/* request packets naming a key that no enabled region has: the
+	 * region was closed or disabled, or never was. Nothing of them is
+	 * placed; each is answered UET_RC_BAD_MKEY. */
+	uint64_t dead_key_pkts;
+};
+
+/*
+ * report what an instance did as a target
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_EINVAL for a bad handle or a NULL stats
+ */
+int uet_get_target_stats(uet_handle_t handle, struct uet_target_stats *stats);
 
 /*
  * install a dma address translator

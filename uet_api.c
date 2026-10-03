@@ -2136,6 +2136,7 @@ static void uet_domain_free(struct uet_domain *uet_dom)
 
 	item = &uet_dom->domain_list_entry;
 	dlist_remove(item);
+	free(uet_dom->mr_desc_alloc_cb.gen);
 	if (uet_dom->mr_desc_alloc_cb.state)
 		free(uet_dom->mr_desc_alloc_cb.state);
 	if (uet_dom->mr_desc) {
@@ -2308,16 +2309,24 @@ struct uet_mr_desc *uet_get_mr_desc(struct uet_ep *uet_ep,
 	 * the same RKEY value may map to different regions in each.
 	 */
 	if (ntohll(ses->match_bits) & UET_MR_KEY_VENDOR_PROV_SPACE) {
-		if (mr_key.rkey >= uet_dom->num_mr)
+		uint64_t index = mr_key.rkey & UET_MR_KEY_PROV_INDEX_MASK;
+
+		if (index >= uet_dom->num_mr)
 			mr_desc = NULL;
 		else {
-			mr_desc = &uet_dom->mr_desc[mr_key.rkey];
+			/* the whole RKEY, generation included, must match: an
+			 * old key of a reused index names no region */
+			mr_desc = &uet_dom->mr_desc[index];
 			if ((mr_desc->state != UET_MR_DESC_STATE_ENABLED) ||
-			    mr_desc->user_key)
+			    mr_desc->user_key ||
+			    (mr_desc->hash_key.rkey != mr_key.rkey))
 				mr_desc = NULL;
 		}
 	} else
 		mr_desc = uet_mr_hash_lookup(uet_ep, &mr_key);
+
+	if (mr_desc == NULL)
+		uet_dom->uet->dead_key_pkts++;
 
 	/* Enforce job-restricted access as a region bound to a JobID may only
 	 * be accessed by requests within that job.
@@ -2414,6 +2423,18 @@ static uet_ses_rc_t uet_get_rx_desc(
 
 	/* operation is rma, find mr associated with key */
 	mr_desc = uet_get_mr_desc(uet_ep, pp);
+	if (mr_desc == NULL && write) {
+		/*
+		 * A write to a dead key: nothing is placed, and the message is
+		 * not tracked. Every packet of it finds no region on its own
+		 * and is answered UET_RC_BAD_MKEY, which fails the initiator's
+		 * operation; the target reports nothing, and a stray packet,
+		 * such as a late duplicate, holds no descriptor.
+		 */
+		uet_rx_desc_list_insert(*rx_desc);
+		*rx_desc = NULL;
+		return UET_RC_BAD_MKEY;
+	}
 	if (mr_desc == NULL) {
 		UET_API_ERR("RX: Invalid RMA Key");
 		ses_rc = UET_RC_BAD_MKEY;
@@ -3927,7 +3948,8 @@ static uet_ses_rc_t uet_rx_req_pkt(
 
 		mr_desc = uet_get_mr_desc(uet_ep, pp);
 		if (mr_desc == NULL) {
-			UET_API_ERR("RX: RUDI Write: Invalid Key");
+			/* counted (dead_key_pkts), not logged: late duplicates
+			 * of writes to a closed region come in bursts */
 			return UET_RC_BAD_MKEY;
 		}
 
@@ -6906,6 +6928,17 @@ static int uet_wire_config(struct uet_instance *uet)
 	return 0;
 }
 
+int uet_get_target_stats(uet_handle_t handle, struct uet_target_stats *stats)
+{
+	struct uet_instance *uet = (struct uet_instance *) handle;
+
+	if ((uet == NULL) || (stats == NULL))
+		return -FI_EINVAL;
+	memset(stats, 0, sizeof(*stats));
+	stats->dead_key_pkts = uet->dead_key_pkts;
+	return FI_SUCCESS;
+}
+
 int uet_get_wire_info(uet_handle_t handle, struct uet_wire_info *info)
 {
 	struct uet_instance *uet = (struct uet_instance *) handle;
@@ -7341,7 +7374,10 @@ int uet_domain(uet_handle_t handle, struct fid_fabric *fabric,
 	/* allocate memory for memory region allocation state */
 	uet_dom->mr_desc_alloc_cb.state = calloc(uet_dom->num_mr,
 						 sizeof(uint8_t));
-	if (uet_dom->mr_desc_alloc_cb.state == NULL) {
+	uet_dom->mr_desc_alloc_cb.gen = calloc(uet_dom->num_mr,
+					       sizeof(uint32_t));
+	if ((uet_dom->mr_desc_alloc_cb.state == NULL) ||
+	    (uet_dom->mr_desc_alloc_cb.gen == NULL)) {
 		UET_API_PRINT_ERRNO("calloc");
 		rc = -FI_ENOMEM;
 		goto err_exit;
@@ -7372,6 +7408,7 @@ int uet_domain(uet_handle_t handle, struct fid_fabric *fabric,
 
 err_exit:
 	if (uet_dom) {
+		free(uet_dom->mr_desc_alloc_cb.gen);
 		if (uet_dom->mr_desc_alloc_cb.state)
 			free(uet_dom->mr_desc_alloc_cb.state);
 		if (uet_dom->mr_desc)
@@ -8380,14 +8417,22 @@ static int uet_mr_alloc_key(struct uet_domain *uet_dom, uint64_t requested_key,
 					 UET_MR_KEY_OPTIMIZED_RKEY_SHIFT));
 			}
 		}
+		rkey = mr_index;
 		if (!desc_allocated) {
 			rc = uet_alloc_mr_desc(uet_dom, &mr_index);
 			if (rc != FI_SUCCESS)
 				return rc;
-			key |= (mr_index << UET_MR_KEY_RKEY_SHIFT);
+			rkey = mr_index;
+			/* a new generation each time the index is reused */
+			if (mr_index <= UET_MR_KEY_PROV_INDEX_MASK)
+				rkey |= ((uint64_t)
+					 (++uet_dom->mr_desc_alloc_cb.gen[mr_index] &
+					  ((1U << (48 - UET_MR_KEY_PROV_INDEX_BITS)) -
+					   1)))
+					<< UET_MR_KEY_PROV_INDEX_BITS;
+			key |= (rkey << UET_MR_KEY_RKEY_SHIFT);
 		}
 		key |= UET_MR_KEY_VENDOR_PROV_SPACE;
-		rkey = mr_index;
 	} else {
 		/*
 		 * User-assigned keys: VENDOR_SPECIFIC MUST be 0. Both the
