@@ -8446,6 +8446,23 @@ static unsigned int uet_log2(uint32_t v)
 }
 
 /*
+ * the RKEY of a provider-assigned key in the standard format for a
+ * descriptor index: the index, and above it a generation that is bumped
+ * each time the index gets a key, so an old key of the index names no
+ * region (an index above UET_MR_KEY_PROV_INDEX_MASK has no room for one)
+ */
+static uint64_t uet_mr_prov_rkey(struct uet_domain *uet_dom, size_t mr_index)
+{
+	uint64_t gen;
+
+	if (mr_index > UET_MR_KEY_PROV_INDEX_MASK)
+		return mr_index;
+	gen = ++uet_dom->mr_desc_alloc_cb.gen[mr_index] &
+	      ((1U << (48 - UET_MR_KEY_PROV_INDEX_BITS)) - 1);
+	return mr_index | (gen << UET_MR_KEY_PROV_INDEX_BITS);
+}
+
+/*
  * allocate a memory region key and descriptor index
  *
  * Shared by every registration entry point, the key spaces and the
@@ -8486,14 +8503,7 @@ static int uet_mr_alloc_key(struct uet_domain *uet_dom, uint64_t requested_key,
 			rc = uet_alloc_mr_desc(uet_dom, &mr_index);
 			if (rc != FI_SUCCESS)
 				return rc;
-			rkey = mr_index;
-			/* a new generation each time the index is reused */
-			if (mr_index <= UET_MR_KEY_PROV_INDEX_MASK)
-				rkey |= ((uint64_t)
-					 (++uet_dom->mr_desc_alloc_cb.gen[mr_index] &
-					  ((1U << (48 - UET_MR_KEY_PROV_INDEX_BITS)) -
-					   1)))
-					<< UET_MR_KEY_PROV_INDEX_BITS;
+			rkey = uet_mr_prov_rkey(uet_dom, mr_index);
 			key |= (rkey << UET_MR_KEY_RKEY_SHIFT);
 		}
 		key |= UET_MR_KEY_VENDOR_PROV_SPACE;
@@ -8758,6 +8768,38 @@ uint64_t uet_mr_key(uet_mr_handle_t mr_handle)
 		return FI_KEY_NOTAVAIL;
 
 	return mr_desc->full_key;
+}
+
+int uet_mr_rekey(uet_mr_handle_t mr_handle, uint64_t *key)
+{
+	struct uet_mr_desc *mr_desc;
+	struct uet_domain *uet_dom;
+	size_t mr_index;
+	uint64_t rkey;
+
+	mr_desc = (struct uet_mr_desc *) mr_handle;
+
+	if ((mr_desc == NULL) || (key == NULL) ||
+	    (mr_desc->state == UET_MR_DESC_STATE_INACTIVE))
+		return -FI_EINVAL;
+	if (mr_desc->user_key || (mr_desc->full_key & UET_MR_KEY_OPTIMIZED))
+		return -FI_ENOSYS;
+	uet_dom = mr_desc->uet_dom;
+	mr_index = (size_t) (mr_desc - uet_dom->mr_desc);
+	if (mr_index > UET_MR_KEY_PROV_INDEX_MASK)
+		return -FI_ENOSYS;
+
+	/*
+	 * Lookups compare the whole RKEY, so the old one finds nothing from
+	 * here on, and the next packet of a message under way with it fails
+	 * the comparison with full_key.
+	 */
+	rkey = uet_mr_prov_rkey(uet_dom, mr_index);
+	mr_desc->full_key = (mr_desc->full_key & ~UET_MR_KEY_RKEY_MASK) |
+			    (rkey << UET_MR_KEY_RKEY_SHIFT);
+	mr_desc->hash_key.rkey = rkey;
+	*key = mr_desc->full_key;
+	return FI_SUCCESS;
 }
 
 int uet_ep_bind_mr(uet_ep_handle_t ep_handle,

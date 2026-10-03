@@ -565,6 +565,31 @@ int uet_mr_reg_pbl(uet_domain_handle_t domain_handle, uet_dma_addr_t pbl_root,
 uint64_t uet_mr_key(uet_mr_handle_t mr_handle);
 
 /*
+ * give a memory region a new protection key
+ *
+ * The region keeps its memory, its endpoint and its state; only the key
+ * peers name it by changes, at once and for good. A request with the old
+ * key finds nothing from then on: it places nothing and is answered
+ * UET_RC_BAD_MKEY, as one naming a closed region is, and a message under
+ * way with the old key fails at its next packet. The old key is never
+ * handed out again. This is what closing a region and registering its
+ * memory again does to its key, without giving up the descriptor.
+ *
+ * Only a provider-assigned key in the standard format can change.
+ *
+ * parms:
+ *   mr_handle - handle identifying uet memory region instance
+ *   key       - location where the new key is returned; uet_mr_key()
+ *               returns it from now on as well
+ *
+ * returns:
+ *   0 on success,
+ *   -FI_EINVAL for a bad handle or a closed region,
+ *   -FI_ENOSYS for a user-assigned key or an optimized-format one
+ */
+int uet_mr_rekey(uet_mr_handle_t mr_handle, uint64_t *key);
+
+/*
  * create and bind counter to memory region
  *
  * parms:
