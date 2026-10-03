@@ -128,15 +128,18 @@ int uet_nic_get_ipv6_addr(const char *ifname,
  * it is, and never deleted. Without a usable one, a datagram to the next
  * hop out of the interface makes the kernel resolve it by ARP, and the
  * table is polled until the entry is usable or UET_NH_WAIT_MS (default
- * 1000) has passed. With UET_NH_WAIT_MS=0 nothing waits: the call returns
- * -EAGAIN while the resolution runs, and a later call finds the MAC. The
- * core retries resolution on every post until it succeeds, so a caller of
- * uet_av_insert() need not wait for a peer that is slow to answer.
+ * 1000) has passed: that is uet_av_insert(), which runs it first. A post
+ * that finds its peer unresolved runs it again without waiting
+ * (uet_nic_get_nh_nowait()): -EAGAIN while ARP runs, and -ENETUNREACH at
+ * once for a next hop whose resolution failed, until it resolves again.
+ * So a post never blocks on a peer, and one to a dead peer fails rather
+ * than asking to be tried again for as long as the kernel keeps asking by
+ * ARP. UET_NH_WAIT_MS=0 makes uet_av_insert() not wait either.
  *
  * This replaces "ip route get", "arp -d" and "ping", which took a process
  * each, deleted a good entry first, and waited up to 10 s for an echo
- * reply from a peer that does not answer ping. Everything here is in local
- * variables, so threads may resolve at once.
+ * reply from a peer that does not answer ping. The scratch is local and
+ * the table of next hops is locked, so threads may resolve at once.
  */
 #define UET_NH_WAIT_MS_ENV	"UET_NH_WAIT_MS"
 #define UET_NH_WAIT_MS_DEF	1000
@@ -380,39 +383,76 @@ static bool uet_nl_neigh_usable(const struct uet_nl_neigh *q)
 }
 
 /*
+ * What is known about the next hops resolved lately, across threads: when
+ * each was last probed, and whether its resolution failed. A next hop
+ * that failed stays failed until it resolves again, so a caller that does
+ * not wait is told at once that the peer is unreachable rather than asked
+ * to try again for as long as the kernel keeps asking it by ARP.
+ */
+#define UET_NH_SLOTS		32
+#define UET_NH_FAILED_PROBE_MS	1000	/* a failed one is asked this often */
+
+static pthread_mutex_t uet_nh_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct {
+	uint32_t nh;		/* network order; 0 for a free slot */
+	uint64_t probed;	/* last probe, ms */
+	bool failed;
+} uet_nh_seen[UET_NH_SLOTS];
+static unsigned int uet_nh_next;
+
+static int uet_nh_slot(uint32_t nh)
+{
+	int i;
+
+	for (i = 0; i < UET_NH_SLOTS; i++)
+		if (uet_nh_seen[i].nh == nh)
+			return i;
+	i = (int)(uet_nh_next++ % UET_NH_SLOTS);
+	uet_nh_seen[i].nh = nh;
+	uet_nh_seen[i].probed = 0;
+	uet_nh_seen[i].failed = false;
+	return i;
+}
+
+static void uet_nh_set_failed(uint32_t nh, bool failed)
+{
+	pthread_mutex_lock(&uet_nh_lock);
+	uet_nh_seen[uet_nh_slot(nh)].failed = failed;
+	pthread_mutex_unlock(&uet_nh_lock);
+}
+
+static bool uet_nh_is_failed(uint32_t nh)
+{
+	bool failed;
+
+	pthread_mutex_lock(&uet_nh_lock);
+	failed = uet_nh_seen[uet_nh_slot(nh)].failed;
+	pthread_mutex_unlock(&uet_nh_lock);
+	return failed;
+}
+
+/*
  * Make the kernel resolve @nh (network order) on @ifname: a datagram to it,
  * bound to the interface (a VRF slave too). It goes once the neighbor is
  * known; the kernel asks by ARP first. At most one per UET_NH_PROBE_MS for
- * a destination, across threads.
+ * a next hop, or per UET_NH_FAILED_PROBE_MS for one that failed.
  */
 static void uet_nh_probe(const char *ifname, int ifindex, uint32_t nh)
 {
-	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-	static struct { uint32_t nh; uint64_t at; } recent[16];
-	static unsigned next;
 	struct sockaddr_in sin;
-	uint64_t now = uet_nh_now_ms();
-	bool skip = false;
-	unsigned i;
-	int fd;
+	uint64_t now = uet_nh_now_ms(), every;
+	bool skip;
+	int i, fd;
 
-	pthread_mutex_lock(&lock);
-	for (i = 0; i < 16; i++) {
-		if (recent[i].nh == nh && recent[i].at != 0 &&
-		    now - recent[i].at < UET_NH_PROBE_MS) {
-			skip = true;
-			break;
-		}
-	}
-	if (!skip) {
-		for (i = 0; i < 16 && recent[i].nh != nh; i++)
-			;
-		if (i == 16)
-			i = next++ % 16;
-		recent[i].nh = nh;
-		recent[i].at = now;
-	}
-	pthread_mutex_unlock(&lock);
+	pthread_mutex_lock(&uet_nh_lock);
+	i = uet_nh_slot(nh);
+	every = uet_nh_seen[i].failed ? UET_NH_FAILED_PROBE_MS :
+					UET_NH_PROBE_MS;
+	skip = uet_nh_seen[i].probed != 0 &&
+	       now - uet_nh_seen[i].probed < every;
+	if (!skip)
+		uet_nh_seen[i].probed = now;
+	pthread_mutex_unlock(&uet_nh_lock);
 	if (skip)
 		return;
 
@@ -437,19 +477,18 @@ static void uet_nh_probe(const char *ifname, int ifindex, uint32_t nh)
 	close(fd);
 }
 
-/* resolve next-hop info for ipv4 destination address */
-int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
-			    int sock_fd,
-			    uint32_t dst_ip,
-			    uint8_t *mac)
+/* resolve next-hop info for ipv4 destination address, waiting up to
+ * wait_ms for ARP */
+int uet_nic_resolve_ipv4_nh_wait(struct uet_nic *nic,
+				 uint32_t dst_ip,
+				 uint8_t *mac,
+				 int wait_ms)
 {
 	char dst_str[INET_ADDRSTRLEN], nh_str[INET_ADDRSTRLEN];
 	struct uet_nl_neigh q;
 	uint32_t dst = htonl(dst_ip), nh;
 	uint64_t deadline;
-	int ifindex, wait_ms, rc;
-
-	(void)sock_fd;
+	int ifindex, rc;
 
 	ifindex = (int)if_nametoindex(nic->ifname);
 	if (ifindex == 0) {
@@ -469,7 +508,6 @@ int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 	memset(&q, 0, sizeof(q));
 	q.ifindex = ifindex;
 	q.ip = nh;
-	wait_ms = uet_nh_wait_ms();
 	deadline = uet_nh_now_ms() + (uint64_t)wait_ms;
 	for (;;) {
 		rc = uet_nl_neighbor(&q);
@@ -482,15 +520,24 @@ int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 			break;
 		/* a failed entry is asked again: the peer may be back */
 		uet_nh_probe(nic->ifname, ifindex, nh);
-		if (wait_ms == 0)
-			return -EAGAIN;
+		if (wait_ms == 0) {
+			/* known unreachable, or the kernel just gave up */
+			if (uet_nh_is_failed(nh) ||
+			    (q.found && (q.state & NUD_FAILED))) {
+				uet_nh_set_failed(nh, true);
+				return -ENETUNREACH;
+			}
+			return -EAGAIN;	/* ARP is running */
+		}
 		if (uet_nh_now_ms() >= deadline) {
 			UET_API_ERR("Unable to resolve next-hop %s of %s",
 				    nh_str, dst_str);
+			uet_nh_set_failed(nh, true);
 			return -ENETUNREACH;
 		}
 		usleep(UET_NH_POLL_US);
 	}
+	uet_nh_set_failed(nh, false);
 
 	memcpy(mac, q.mac, ETH_ALEN);
 
@@ -501,6 +548,17 @@ int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 	uet_print_mac_addr(mac);
 
 	return 0;
+}
+
+/* resolve next-hop info for ipv4 destination address */
+int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
+			    int sock_fd,
+			    uint32_t dst_ip,
+			    uint8_t *mac)
+{
+	(void)sock_fd;
+	return uet_nic_resolve_ipv4_nh_wait(nic, dst_ip, mac,
+					    uet_nh_wait_ms());
 }
 
 /* resolve next-hop info for ipv6 destination address */

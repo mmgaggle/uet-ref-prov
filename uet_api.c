@@ -2067,12 +2067,22 @@ static void uet_ep_free_all(struct uet_domain *uet_dom)
 	}
 }
 
+/*
+ * The address vector lists. uet_av_insert() resolves a peer's next hop,
+ * which can wait on ARP, before it takes this lock, so a caller may insert
+ * a peer on one thread while it posts and makes progress on others: only
+ * the list itself is shared.
+ */
+static pthread_mutex_t uet_av_list_lock = PTHREAD_MUTEX_INITIALIZER;
+
 /* insert entry into list of address vector entries for domain */
 static void uet_av_entry_insert(struct uet_domain *uet_dom,
 				struct uet_av_entry *av_entry)
 {
+	pthread_mutex_lock(&uet_av_list_lock);
 	dlist_insert_head(&av_entry->av_list_entry,
 			  &uet_dom->av_list_head);
+	pthread_mutex_unlock(&uet_av_list_lock);
 }
 
 /* free resources associated with an address vector entry */
@@ -2080,8 +2090,10 @@ static void uet_av_entry_free(struct uet_av_entry *av_entry)
 {
 	struct dlist_entry *item;
 
+	pthread_mutex_lock(&uet_av_list_lock);
 	item = &av_entry->av_list_entry;
 	dlist_remove(item);
+	pthread_mutex_unlock(&uet_av_list_lock);
 	free(av_entry);
 }
 
@@ -2091,6 +2103,7 @@ static void uet_av_free_all(struct uet_domain *uet_dom)
 	struct dlist_entry *head, *item;
 	struct uet_av_entry *av_entry;
 
+	pthread_mutex_lock(&uet_av_list_lock);
 	head = &uet_dom->av_list_head;
 	dlist_foreach(head, item) {
 		av_entry = container_of(item, struct uet_av_entry,
@@ -2099,6 +2112,7 @@ static void uet_av_free_all(struct uet_domain *uet_dom)
 		item = head;
 		free(av_entry);
 	}
+	pthread_mutex_unlock(&uet_av_list_lock);
 }
 
 /* insert entry into list of domains */
@@ -6266,11 +6280,12 @@ static ssize_t uet_send_req_api_common(
 		return -FI_EIO;
 	}
 
-	/* check next-hop mac address */
+	/* check next-hop mac address; a post never waits for ARP, so a
+	 * caller retries on -FI_EAGAIN and a dead peer fails at once */
 	if (!(av_entry->flags & UET_NH_MAC_ADDR_V)) {
-		rc = uet_nic_get_nh(UET_NIC(uet), &av_entry->addr->fa,
-				    uet_addr_is_ipv6(av_entry->addr),
-				    av_entry->nh_mac_addr);
+		rc = uet_nic_get_nh_nowait(UET_NIC(uet), &av_entry->addr->fa,
+					   uet_addr_is_ipv6(av_entry->addr),
+					   av_entry->nh_mac_addr);
 		if (rc != FI_SUCCESS)
 			return rc;
 		av_entry->flags |= UET_NH_MAC_ADDR_V;

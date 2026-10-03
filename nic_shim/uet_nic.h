@@ -268,6 +268,15 @@ int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 			    uint8_t *mac);
 
 /*
+ * the same, waiting at most wait_ms for ARP; with 0 it returns -EAGAIN
+ * while ARP runs and -ENETUNREACH for a next hop whose resolution failed
+ */
+int uet_nic_resolve_ipv4_nh_wait(struct uet_nic *nic,
+				 uint32_t dst_ip,
+				 uint8_t *mac,
+				 int wait_ms);
+
+/*
  * helper to resolve IPv6 next-hop MAC address
  *
  * parms:
@@ -408,6 +417,24 @@ static inline int uet_nic_get_nh(struct uet_nic *nic,
 		return uet_nic_get_ipv6_nh(nic, fa->v6, mac);
 	else
 		return uet_nic_get_ipv4_nh(nic, fa->v4, mac);
+}
+
+/*
+ * the same without waiting, for a post that finds its peer unresolved:
+ * -EAGAIN while ARP runs, -ENETUNREACH for a next hop that failed. A shim
+ * with a resolver of its own already never waits; IPv6 still does.
+ */
+static inline int uet_nic_get_nh_nowait(struct uet_nic *nic,
+					const struct uet_fa *fa,
+					bool is_ipv6,
+					uint8_t *mac)
+{
+	if (!nic || !fa || !mac)
+		assert(0);
+
+	if (is_ipv6 || nic->nic_resolve_nh)
+		return uet_nic_get_nh(nic, fa, is_ipv6, mac);
+	return uet_nic_resolve_ipv4_nh_wait(nic, fa->v4, mac, 0);
 }
 
 /*
